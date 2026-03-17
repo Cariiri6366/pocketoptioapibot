@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from pocketoptionapi_async.constants import TIMEFRAMES
@@ -121,7 +121,7 @@ async def _compute_signal(
             return None
         except InvalidParameterError as e:
             logger.warning("Invalid parameter for %s %s: %s", asset, timeframe, e)
-            raise
+            return None
         except PocketOptionError as e:
             logger.warning("PocketOption error for %s %s: %s", asset, timeframe, e)
             return None
@@ -299,6 +299,32 @@ async def tracked_assets():
     }
 
 
+def _safe_placeholder(asset: str, timeframe: str) -> dict:
+    """Always-valid fallback signal. Never fail the client."""
+    return {
+        "asset": asset,
+        "timeframe": timeframe,
+        "direction": "neutral",
+        "confidence": 10,
+        "message": "Live data warming up",
+        "generated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "cached": True,
+        "firestore_fallback": False,
+        "fallback": True,
+        "source": "fallback_safe",
+    }
+
+
+def _enrich(data: dict, source: str, cached: bool, fallback: bool) -> dict:
+    """Ensure consistent response fields."""
+    out = dict(data)
+    out["source"] = source
+    out["cached"] = cached
+    out["fallback"] = fallback
+    out.setdefault("firestore_fallback", source == "firestore_fallback")
+    return out
+
+
 @app.get("/signal")
 async def get_signal(
     asset: str = Query(..., description="PocketOption asset, e.g. EURUSD_otc"),
@@ -307,34 +333,27 @@ async def get_signal(
 ):
     """
     Get trading signal for asset/timeframe.
-    Flow: memory cache -> Firestore fallback -> live compute.
-    Returns consistent response with source, firestore_fallback, cached.
+    ALWAYS returns 200 with valid JSON. Never raises.
+    Priority: memory_cache -> firestore_fallback -> live -> fallback_safe
     """
+    # Normalize timeframe - use 1m if invalid (never fail)
     if timeframe not in TIMEFRAMES:
-        raise HTTPException(status_code=400, detail="Invalid timeframe")
+        logger.debug("Invalid timeframe %s, using 1m", timeframe)
+        timeframe = "1m"
 
-    def _enrich(data: dict, source: str, cached: bool, fallback: bool) -> dict:
-        """Ensure consistent response fields."""
-        out = dict(data)
-        out["source"] = source
-        out["cached"] = cached
-        out["fallback"] = fallback
-        out.setdefault("firestore_fallback", source == "firestore_fallback")
-        return out
-
-    # 1. Return memory cache immediately if fresh
-    cached = await signal_cache.get(asset, timeframe)
-    if cached:
-        return _enrich(cached, "memory_cache", cached=True, fallback=False)
-
-    # 2. Try Firestore fallback if enabled and memory cache miss
-    fs_signal = get_latest_signal(asset, timeframe, max_age_sec=FIRESTORE_LATEST_TTL_SEC)
-    if fs_signal:
-        return _enrich(fs_signal, "firestore_fallback", cached=True, fallback=True)
-
-    # 3. Try live fetch (do not fail fast - fallbacks are tried after)
-    result = None
     try:
+        # Step 1: Memory cache (aggressive - 5-10 sec TTL)
+        cached = await signal_cache.get(asset, timeframe)
+        if cached:
+            return _enrich(cached, "memory_cache", cached=True, fallback=False)
+
+        # Step 2: Firestore fallback (if enabled)
+        if ENABLE_FIRESTORE:
+            fs_signal = get_latest_signal(asset, timeframe, max_age_sec=FIRESTORE_LATEST_TTL_SEC)
+            if fs_signal:
+                return _enrich(fs_signal, "firestore_fallback", cached=True, fallback=True)
+
+        # Step 3: Live calculation (retry handled inside _compute_signal)
         result = await _compute_signal(asset, timeframe, count)
         if result:
             result["cached"] = False
@@ -342,30 +361,29 @@ async def get_signal(
             result["fallback"] = False
             result["source"] = "live"
             await signal_cache.set(asset, timeframe, result)
-            save_latest_signal(asset, timeframe, result, source="live", is_demo=IS_DEMO)
-            _maybe_append_history(asset, timeframe, result)
+            if ENABLE_FIRESTORE:
+                save_latest_signal(asset, timeframe, result, source="live", is_demo=IS_DEMO)
+                _maybe_append_history(asset, timeframe, result)
             return result
-    except InvalidParameterError as e:
-        raise HTTPException(status_code=400, detail="Invalid asset or timeframe")
+
+        # Step 4a: Firestore stale (last resort)
+        if ENABLE_FIRESTORE:
+            fs_stale = get_latest_signal(asset, timeframe, max_age_sec=86400)
+            if fs_stale:
+                return _enrich(fs_stale, "firestore_fallback", cached=True, fallback=True)
+
+        # Step 4b: Memory cache stale
+        stale = await signal_cache.get_stale(asset, timeframe)
+        if stale:
+            return _enrich(stale, "memory_cache", cached=True, fallback=True)
+
+        # Step 4c: FINAL - safe placeholder (never fail)
+        logger.info("All fallbacks exhausted for %s %s, returning safe placeholder", asset, timeframe)
+        return _safe_placeholder(asset, timeframe)
+
     except Exception as e:
-        logger.warning("Live signal fetch failed for %s %s: %s", asset, timeframe, e)
-
-    # 4. Fallback: Firestore again (ignore TTL - last resort)
-    fs_stale = get_latest_signal(asset, timeframe, max_age_sec=86400)
-    if fs_stale:
-        return _enrich(fs_stale, "firestore_fallback", cached=True, fallback=True)
-
-    # 5. Fallback: return last memory cached (even if stale)
-    stale = await signal_cache.get_stale(asset, timeframe)
-    if stale:
-        return _enrich(stale, "memory_cache", cached=True, fallback=True)
-
-    # 6. Only return 503 when ALL fallbacks exhausted
-    logger.info("Signal unavailable for %s %s: no cache, no Firestore, live failed", asset, timeframe)
-    raise HTTPException(
-        status_code=503,
-        detail="Signal unavailable. Server may be warming up. Please retry.",
-    )
+        logger.warning("Signal endpoint error for %s %s: %s", asset, timeframe, e)
+        return _safe_placeholder(asset, timeframe)
 
 
 # ---------------------------------------------------------------------------
