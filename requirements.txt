@@ -1,6 +1,8 @@
+fastapi
+uvicorn
+python-dotenv
 aiohttp>=3.8.0
-websockets>=11.0.0
-asyncio
+websockets==11.0
 python-dotenv>=1.0.0
 tzlocal>=4.0.0
 typing-extensions>=4.0.0

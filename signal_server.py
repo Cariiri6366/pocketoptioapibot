@@ -6,9 +6,13 @@ from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
 
 from pocketoptionapi_async.client import AsyncPocketOptionClient
 from pocketoptionapi_async.constants import TIMEFRAMES
+
+# Load environment variables from .env file (if present)
+load_dotenv()
 
 PO_SSID = os.environ.get("PO_SSID")
 if not PO_SSID:
