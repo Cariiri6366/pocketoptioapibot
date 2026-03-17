@@ -51,3 +51,13 @@ CANDLE_TIMEOUT_SEC = float(os.environ.get("SIGNAL_CANDLE_TIMEOUT_SEC", "15"))
 
 # Reconnection: max attempts when connection is lost
 RECONNECT_MAX_ATTEMPTS = int(os.environ.get("SIGNAL_RECONNECT_ATTEMPTS", "3"))
+
+# ---------------------------------------------------------------------------
+# Firestore (optional)
+# ---------------------------------------------------------------------------
+ENABLE_FIRESTORE = os.environ.get("ENABLE_FIRESTORE", "false").strip().lower() in ("true", "1", "yes")
+FIRESTORE_WRITE_HISTORY = os.environ.get("FIRESTORE_WRITE_HISTORY", "true").strip().lower() in ("true", "1", "yes")
+HISTORY_WRITE_INTERVAL_SEC = int(os.environ.get("HISTORY_WRITE_INTERVAL_SEC", "60"))
+FIRESTORE_LATEST_TTL_SEC = int(os.environ.get("FIRESTORE_LATEST_TTL_SEC", "300"))
+# Service account JSON as string (from env) or path via GOOGLE_APPLICATION_CREDENTIALS
+FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()

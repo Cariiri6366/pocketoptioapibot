@@ -8,6 +8,7 @@ Nuunipay Signals Bot - Production-ready FastAPI backend for Render.
 """
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -30,11 +31,23 @@ from config import (
     CACHE_TTL_SEC,
     CANDLE_TIMEOUT_SEC,
     DEFAULT_CANDLE_COUNT,
+    ENABLE_FIRESTORE,
+    FIRESTORE_LATEST_TTL_SEC,
+    FIRESTORE_WRITE_HISTORY,
+    FIREBASE_SERVICE_ACCOUNT_JSON,
+    HISTORY_WRITE_INTERVAL_SEC,
+    IS_DEMO,
     MIN_CANDLES_FOR_SIGNAL,
     PO_SSID,
     REFRESH_INTERVAL_SEC,
     TRACKED_ASSETS,
     TRACKED_TIMEFRAMES,
+)
+from firestore_helper import (
+    append_signal_history,
+    get_latest_signal,
+    init_firestore,
+    save_latest_signal,
 )
 from signal_cache import SignalCacheManager
 from signal_logic import compute_signal
@@ -56,6 +69,9 @@ logger = logging.getLogger("nuunipay.signals")
 
 signal_cache = SignalCacheManager(ttl_sec=CACHE_TTL_SEC)
 _background_task: asyncio.Task | None = None
+# Track last signal per asset:timeframe for history write throttling
+_last_signal_for_history: dict[str, tuple[str, int]] = {}
+_last_history_write_time: dict[str, float] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +82,7 @@ async def _compute_signal(
 ) -> dict | None:
     """Fetch candles, compute signal, return standardized dict or None on failure."""
     try:
-        cli = await asyncio.wait_for(get_client(), timeout=25.0)
+        cli = await asyncio.wait_for(get_client(), timeout=45.0)
         df = await asyncio.wait_for(
             cli.get_candles_dataframe(
                 asset, timeframe, count=count, end_time=datetime.now()
@@ -84,6 +100,8 @@ async def _compute_signal(
             "message": message,
             "generated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
             "cached": False,
+            "firestore_fallback": False,
+            "source": "live",
         }
     except asyncio.TimeoutError:
         logger.warning("Candle fetch or connection timeout for %s %s", asset, timeframe)
@@ -100,6 +118,30 @@ async def _compute_signal(
     except Exception as e:
         logger.exception("Unexpected error computing signal for %s %s", asset, timeframe)
         return None
+
+
+def _maybe_append_history(asset: str, timeframe: str, result: dict) -> None:
+    """Append to signal_history only when direction/confidence changes and interval elapsed."""
+    if not FIRESTORE_WRITE_HISTORY:
+        return
+    key = SignalCacheManager.key(asset, timeframe)
+    now = time.monotonic()
+    last_write = _last_history_write_time.get(key, 0)
+    if now - last_write < HISTORY_WRITE_INTERVAL_SEC:
+        return  # Throttle: don't write more often than interval
+    last = _last_signal_for_history.get(key)
+    last_dir, last_conf = last if last else (None, None)
+    if append_signal_history(
+        asset,
+        timeframe,
+        result,
+        source="live",
+        last_direction=last_dir,
+        last_confidence=last_conf,
+        confidence_delta_threshold=15,
+    ):
+        _last_history_write_time[key] = now
+    _last_signal_for_history[key] = (result.get("direction", "neutral"), result.get("confidence", 0))
 
 
 async def _background_refresh_loop():
@@ -123,6 +165,8 @@ async def _background_refresh_loop():
                         result = await _compute_signal(asset, tf)
                         if result:
                             await signal_cache.set(asset, tf, result)
+                            save_latest_signal(asset, tf, result, source="live", is_demo=IS_DEMO)
+                            _maybe_append_history(asset, tf, result)
                     except InvalidParameterError:
                         pass  # Skip invalid asset/tf
                     except Exception as e:
@@ -140,9 +184,10 @@ async def _background_refresh_loop():
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: connect client and start background refresh. Shutdown: cleanup."""
+    """Startup: connect client, init Firestore, start background refresh. Shutdown: cleanup."""
     global _background_task
     try:
+        init_firestore(ENABLE_FIRESTORE, FIREBASE_SERVICE_ACCOUNT_JSON or None)
         await ensure_connected()
         _background_task = asyncio.create_task(_background_refresh_loop())
         logger.info("Nuunipay Signals Bot started")
@@ -233,31 +278,50 @@ async def get_signal(
 ):
     """
     Get trading signal for asset/timeframe.
-    Returns cached result if fresh; otherwise fetches live or falls back to stale cache.
+    Flow: memory cache -> Firestore fallback -> live compute.
+    Returns consistent response with source, firestore_fallback, cached.
     """
     if timeframe not in TIMEFRAMES:
         raise HTTPException(status_code=400, detail="Invalid timeframe")
 
-    # 1. Return cached immediately if fresh
+    # 1. Return memory cache immediately if fresh
     cached = await signal_cache.get(asset, timeframe)
     if cached:
+        cached["source"] = "memory_cache"
+        cached["firestore_fallback"] = False
         return cached
 
-    # 2. Try live fetch
+    # 2. Try Firestore fallback if enabled and memory cache miss
+    fs_signal = get_latest_signal(asset, timeframe, max_age_sec=FIRESTORE_LATEST_TTL_SEC)
+    if fs_signal:
+        return fs_signal
+
+    # 3. Try live fetch
     try:
         result = await _compute_signal(asset, timeframe, count)
         if result:
             result["cached"] = False
+            result["firestore_fallback"] = False
+            result["source"] = "live"
             await signal_cache.set(asset, timeframe, result)
+            save_latest_signal(asset, timeframe, result, source="live", is_demo=IS_DEMO)
+            _maybe_append_history(asset, timeframe, result)
             return result
     except InvalidParameterError as e:
         raise HTTPException(status_code=400, detail="Invalid asset or timeframe")
     except Exception as e:
         logger.warning("Live signal fetch failed for %s %s: %s", asset, timeframe, e)
 
-    # 3. Fallback: return last cached (even if stale)
+    # 4. Fallback: Firestore again (ignore TTL - last resort)
+    fs_stale = get_latest_signal(asset, timeframe, max_age_sec=86400)
+    if fs_stale:
+        return fs_stale
+
+    # 5. Fallback: return last memory cached (even if stale)
     stale = await signal_cache.get_stale(asset, timeframe)
     if stale:
+        stale["source"] = "memory_cache"
+        stale["firestore_fallback"] = False
         return stale
 
     raise HTTPException(

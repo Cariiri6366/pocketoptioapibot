@@ -68,4 +68,10 @@ class SignalCacheManager:
         return items
 
     def _to_response(self, entry: dict) -> dict:
-        return {k: v for k, v in entry.items() if not k.startswith("_")}
+        out = {k: v for k, v in entry.items() if not k.startswith("_")}
+        # Ensure consistent API response fields
+        if "source" not in out:
+            out["source"] = "memory_cache"
+        if "firestore_fallback" not in out:
+            out["firestore_fallback"] = False
+        return out
