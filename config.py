@@ -46,8 +46,8 @@ TRACKED_TIMEFRAMES: List[str] = [
     tf.strip() for tf in _TRACKED_TF_STR.split(",") if tf.strip()
 ] or ["1m", "5m"]
 
-# Candle request timeout (seconds)
-CANDLE_TIMEOUT_SEC = float(os.environ.get("SIGNAL_CANDLE_TIMEOUT_SEC", "15"))
+# Candle request timeout (seconds) - PocketOption candle API can be slow after cold start
+CANDLE_TIMEOUT_SEC = float(os.environ.get("SIGNAL_CANDLE_TIMEOUT_SEC", "30"))
 
 # Reconnection: max attempts when connection is lost
 RECONNECT_MAX_ATTEMPTS = int(os.environ.get("SIGNAL_RECONNECT_ATTEMPTS", "3"))

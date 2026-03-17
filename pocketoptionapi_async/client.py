@@ -1001,8 +1001,8 @@ class AsyncPocketOptionClient:
             await self._websocket.send_message(message)
 
         try:
-            # Wait for the response (with timeout - 15s for slow connections)
-            candles = await asyncio.wait_for(candle_future, timeout=15.0)
+            # Wait for the response (30s for slow connections / cold start)
+            candles = await asyncio.wait_for(candle_future, timeout=30.0)
             return candles
         except asyncio.TimeoutError:
             if self.enable_logging:

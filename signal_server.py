@@ -81,43 +81,54 @@ async def _compute_signal(
     asset: str, timeframe: str, count: int = DEFAULT_CANDLE_COUNT
 ) -> dict | None:
     """Fetch candles, compute signal, return standardized dict or None on failure."""
-    try:
-        cli = await asyncio.wait_for(get_client(), timeout=45.0)
-        df = await asyncio.wait_for(
-            cli.get_candles_dataframe(
-                asset, timeframe, count=count, end_time=datetime.now()
-            ),
-            timeout=CANDLE_TIMEOUT_SEC,
-        )
-        direction, confidence, message = compute_signal(
-            df, min_candles=MIN_CANDLES_FOR_SIGNAL
-        )
-        return {
-            "asset": asset,
-            "timeframe": timeframe,
-            "direction": direction,
-            "confidence": confidence,
-            "message": message,
-            "generated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "cached": False,
-            "firestore_fallback": False,
-            "source": "live",
-        }
-    except asyncio.TimeoutError:
-        logger.warning("Candle fetch or connection timeout for %s %s", asset, timeframe)
-        return None
-    except POConnectionError as e:
-        logger.warning("Connection error for %s %s: %s", asset, timeframe, e)
-        return None
-    except InvalidParameterError as e:
-        logger.warning("Invalid parameter for %s %s: %s", asset, timeframe, e)
-        raise
-    except PocketOptionError as e:
-        logger.warning("PocketOption error for %s %s: %s", asset, timeframe, e)
-        return None
-    except Exception as e:
-        logger.exception("Unexpected error computing signal for %s %s", asset, timeframe)
-        return None
+    timeout_sec = max(CANDLE_TIMEOUT_SEC, 30)
+    for attempt in range(2):  # Retry once on timeout (helps cold start)
+        try:
+            cli = await asyncio.wait_for(get_client(), timeout=45.0)
+            df = await asyncio.wait_for(
+                cli.get_candles_dataframe(
+                    asset, timeframe, count=count, end_time=datetime.now()
+                ),
+                timeout=timeout_sec,
+            )
+            direction, confidence, message = compute_signal(
+                df, min_candles=MIN_CANDLES_FOR_SIGNAL
+            )
+            return {
+                "asset": asset,
+                "timeframe": timeframe,
+                "direction": direction,
+                "confidence": confidence,
+                "message": message,
+                "generated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "cached": False,
+                "firestore_fallback": False,
+                "source": "live",
+            }
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Candle fetch timeout for %s %s (attempt %d/2)",
+                asset,
+                timeframe,
+                attempt + 1,
+            )
+            if attempt == 0:
+                await asyncio.sleep(2)  # Brief pause before retry
+                continue
+            return None
+        except POConnectionError as e:
+            logger.warning("Connection error for %s %s: %s", asset, timeframe, e)
+            return None
+        except InvalidParameterError as e:
+            logger.warning("Invalid parameter for %s %s: %s", asset, timeframe, e)
+            raise
+        except PocketOptionError as e:
+            logger.warning("PocketOption error for %s %s: %s", asset, timeframe, e)
+            return None
+        except Exception as e:
+            logger.exception("Unexpected error computing signal for %s %s", asset, timeframe)
+            return None
+    return None
 
 
 def _maybe_append_history(asset: str, timeframe: str, result: dict) -> None:
