@@ -130,10 +130,11 @@ def save_latest_signal(
 def get_latest_signal(
     asset: str,
     timeframe: str,
-    max_age_sec: int = 300,
+    max_age_sec: int | None = 300,
 ) -> dict | None:
     """
-    Get latest signal from Firestore if fresh enough.
+    Get latest signal from Firestore.
+    max_age_sec: Max age in seconds; None = accept any age (for stale fallback).
     Returns dict or None. Never raises.
     """
     if not is_enabled():
@@ -151,18 +152,19 @@ def get_latest_signal(
         if not data:
             return None
 
-        updated_at = data.get("updated_at")
-        if updated_at:
-            try:
-                s = str(updated_at).replace("Z", "+00:00")
-                dt = datetime.fromisoformat(s)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                age = (datetime.now(timezone.utc) - dt).total_seconds()
-                if age > max_age_sec:
-                    return None
-            except Exception:
-                pass
+        if max_age_sec is not None:
+            updated_at = data.get("updated_at")
+            if updated_at:
+                try:
+                    s = str(updated_at).replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(s)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    age = (datetime.now(timezone.utc) - dt).total_seconds()
+                    if age > max_age_sec:
+                        return None
+                except Exception:
+                    pass
 
         return {
             "asset": data.get("asset", asset),
@@ -173,7 +175,8 @@ def get_latest_signal(
             "generated_at": data.get("generated_at", ""),
             "cached": True,
             "firestore_fallback": True,
-            "source": "firestore",
+            "fallback": False,
+            "source": "firestore_fallback",
         }
     except Exception as e:
         logger.warning("Firestore get_latest_signal failed: %s", e)

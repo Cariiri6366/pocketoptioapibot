@@ -47,6 +47,7 @@ from firestore_helper import (
     append_signal_history,
     get_latest_signal,
     init_firestore,
+    is_enabled as firestore_is_enabled,
     save_latest_signal,
 )
 from signal_cache import SignalCacheManager
@@ -155,12 +156,25 @@ def _maybe_append_history(asset: str, timeframe: str, result: dict) -> None:
     _last_signal_for_history[key] = (result.get("direction", "neutral"), result.get("confidence", 0))
 
 
+def _priority_pairs() -> list[tuple[str, str]]:
+    """Return (asset, timeframe) pairs in priority order: common pairs first for fast warm-up."""
+    priority_asset = "EURUSD_otc" if "EURUSD_otc" in TRACKED_ASSETS else (TRACKED_ASSETS[0] if TRACKED_ASSETS else "EURUSD_otc")
+    priority_tfs = [t for t in ["1m", "5m"] if t in TRACKED_TIMEFRAMES] or TRACKED_TIMEFRAMES
+    pairs = [(priority_asset, tf) for tf in priority_tfs]
+    for asset in TRACKED_ASSETS:
+        for tf in TRACKED_TIMEFRAMES:
+            if (asset, tf) not in pairs:
+                pairs.append((asset, tf))
+    return pairs
+
+
 async def _background_refresh_loop():
-    """Periodically refresh signals for tracked asset/timeframe pairs."""
+    """Periodically refresh signals for tracked asset/timeframe pairs. Pre-fills cache before requests."""
+    pairs = _priority_pairs()
     logger.info(
-        "Background refresh started: %d assets, %d timeframes, interval=%ds",
-        len(TRACKED_ASSETS),
-        len(TRACKED_TIMEFRAMES),
+        "Background refresh started: %d pairs (priority: %s 1m/5m), interval=%ds",
+        len(pairs),
+        pairs[0][0] if pairs else "?",
         REFRESH_INTERVAL_SEC,
     )
     while True:
@@ -170,18 +184,17 @@ async def _background_refresh_loop():
                 await asyncio.sleep(REFRESH_INTERVAL_SEC)
                 continue
 
-            for asset in TRACKED_ASSETS:
-                for tf in TRACKED_TIMEFRAMES:
-                    try:
-                        result = await _compute_signal(asset, tf)
-                        if result:
-                            await signal_cache.set(asset, tf, result)
-                            save_latest_signal(asset, tf, result, source="live", is_demo=IS_DEMO)
-                            _maybe_append_history(asset, tf, result)
-                    except InvalidParameterError:
-                        pass  # Skip invalid asset/tf
-                    except Exception as e:
-                        logger.debug("Background refresh %s %s: %s", asset, tf, e)
+            for asset, tf in pairs:
+                try:
+                    result = await _compute_signal(asset, tf)
+                    if result:
+                        await signal_cache.set(asset, tf, result)
+                        save_latest_signal(asset, tf, result, source="live", is_demo=IS_DEMO)
+                        _maybe_append_history(asset, tf, result)
+                except InvalidParameterError:
+                    pass  # Skip invalid asset/tf
+                except Exception as e:
+                    logger.debug("Background refresh %s %s: %s", asset, tf, e)
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -200,10 +213,10 @@ async def lifespan(app: FastAPI):
     try:
         init_firestore(ENABLE_FIRESTORE, FIREBASE_SERVICE_ACCOUNT_JSON or None)
         await ensure_connected()
-        _background_task = asyncio.create_task(_background_refresh_loop())
-        logger.info("Nuunipay Signals Bot started")
     except Exception as e:
-        logger.error("Startup failed: %s", e)
+        logger.warning("Startup connection failed: %s (background refresh will retry)", e)
+    _background_task = asyncio.create_task(_background_refresh_loop())
+    logger.info("Nuunipay Signals Bot started")
     yield
     if _background_task:
         _background_task.cancel()
@@ -263,7 +276,7 @@ async def warm():
 
 @app.get("/health")
 async def health():
-    """Health check - connection status. Does not crash on failure."""
+    """Health check - connection status, cache size, Firestore. Does not crash on failure."""
     try:
         connected = is_connected()
         if not connected:
@@ -275,18 +288,33 @@ async def health():
         return {
             "status": "ok" if connected else "degraded",
             "connected": connected,
+            "cache_size": signal_cache.size(),
+            "firestore_enabled": firestore_is_enabled(),
             "warm": True,
         }
     except Exception as e:
         logger.warning("Health check failed: %s", e)
-        return {"status": "error", "connected": False, "warm": True}
+        return {
+            "status": "error",
+            "connected": False,
+            "cache_size": signal_cache.size(),
+            "firestore_enabled": firestore_is_enabled(),
+            "warm": True,
+        }
 
 
 @app.get("/debug/cache")
 async def debug_cache():
-    """Show cache keys and freshness (no secrets)."""
+    """Show cache keys, freshness, and tracked assets (no secrets)."""
     items = await signal_cache.get_debug_info()
-    return {"keys": items, "ttl_sec": CACHE_TTL_SEC}
+    return {
+        "keys": items,
+        "ttl_sec": CACHE_TTL_SEC,
+        "cache_size": signal_cache.size(),
+        "tracked_assets": TRACKED_ASSETS,
+        "tracked_timeframes": TRACKED_TIMEFRAMES,
+        "refresh_interval_sec": REFRESH_INTERVAL_SEC,
+    }
 
 
 @app.get("/tracked-assets")
@@ -316,13 +344,18 @@ def _safe_placeholder(asset: str, timeframe: str) -> dict:
 
 
 def _enrich(data: dict, source: str, cached: bool, fallback: bool) -> dict:
-    """Ensure consistent response fields."""
+    """Ensure consistent response shape for API."""
     out = dict(data)
     out["source"] = source
     out["cached"] = cached
     out["fallback"] = fallback
     out.setdefault("firestore_fallback", source == "firestore_fallback")
     return out
+
+
+def _log_source(asset: str, timeframe: str, source: str) -> None:
+    """Log which source was used (diagnostics)."""
+    logger.debug("Signal %s %s: source=%s", asset, timeframe, source)
 
 
 @app.get("/signal")
@@ -334,7 +367,7 @@ async def get_signal(
     """
     Get trading signal for asset/timeframe.
     ALWAYS returns 200 with valid JSON. Never raises.
-    Priority: memory_cache -> firestore_fallback -> live -> fallback_safe
+    Priority: memory_cache -> firestore_fallback -> live -> memory_cache stale -> firestore stale -> fallback_safe
     """
     # Normalize timeframe - use 1m if invalid (never fail)
     if timeframe not in TIMEFRAMES:
@@ -342,18 +375,22 @@ async def get_signal(
         timeframe = "1m"
 
     try:
-        # Step 1: Memory cache (aggressive - 5-10 sec TTL)
+        # Step 1: Memory cache (fresh, within TTL)
         cached = await signal_cache.get(asset, timeframe)
         if cached:
-            return _enrich(cached, "memory_cache", cached=True, fallback=False)
+            resp = _enrich(cached, "memory_cache", cached=True, fallback=False)
+            _log_source(asset, timeframe, "memory_cache")
+            return resp
 
-        # Step 2: Firestore fallback (if enabled)
+        # Step 2: Firestore (if enabled, recent data)
         if ENABLE_FIRESTORE:
             fs_signal = get_latest_signal(asset, timeframe, max_age_sec=FIRESTORE_LATEST_TTL_SEC)
             if fs_signal:
-                return _enrich(fs_signal, "firestore_fallback", cached=True, fallback=True)
+                resp = _enrich(fs_signal, "firestore_fallback", cached=True, fallback=False)
+                _log_source(asset, timeframe, "firestore_fallback")
+                return resp
 
-        # Step 3: Live calculation (retry handled inside _compute_signal)
+        # Step 3: Live calculation (retry once inside _compute_signal)
         result = await _compute_signal(asset, timeframe, count)
         if result:
             result["cached"] = False
@@ -364,21 +401,30 @@ async def get_signal(
             if ENABLE_FIRESTORE:
                 save_latest_signal(asset, timeframe, result, source="live", is_demo=IS_DEMO)
                 _maybe_append_history(asset, timeframe, result)
+            _log_source(asset, timeframe, "live")
             return result
 
-        # Step 4a: Firestore stale (last resort)
+        # Step 4: Live failed - prefer memory cache stale (most recent we have)
+        stale_cache = await signal_cache.get_stale(asset, timeframe)
+        if stale_cache:
+            resp = _enrich(stale_cache, "memory_cache", cached=True, fallback=False)
+            _log_source(asset, timeframe, "memory_cache_stale")
+            return resp
+
+        # Step 5: Firestore stale (any age - real data from history)
         if ENABLE_FIRESTORE:
-            fs_stale = get_latest_signal(asset, timeframe, max_age_sec=86400)
+            fs_stale = get_latest_signal(asset, timeframe, max_age_sec=None)
             if fs_stale:
-                return _enrich(fs_stale, "firestore_fallback", cached=True, fallback=True)
+                resp = _enrich(fs_stale, "firestore_fallback", cached=True, fallback=False)
+                _log_source(asset, timeframe, "firestore_fallback_stale")
+                return resp
 
-        # Step 4b: Memory cache stale
-        stale = await signal_cache.get_stale(asset, timeframe)
-        if stale:
-            return _enrich(stale, "memory_cache", cached=True, fallback=True)
-
-        # Step 4c: FINAL - safe placeholder (never fail)
-        logger.info("All fallbacks exhausted for %s %s, returning safe placeholder", asset, timeframe)
+        # Step 6: FINAL - safe placeholder (only when no cache, no Firestore, live failed)
+        logger.warning(
+            "fallback_safe: all sources exhausted for %s %s (no cache, no Firestore, live failed)",
+            asset,
+            timeframe,
+        )
         return _safe_placeholder(asset, timeframe)
 
     except Exception as e:

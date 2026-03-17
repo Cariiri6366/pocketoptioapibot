@@ -49,6 +49,10 @@ class SignalCacheManager:
         """Get last cached result even if expired (fallback when live fetch fails)."""
         return await self.get(asset, timeframe, allow_stale=True)
 
+    def size(self) -> int:
+        """Return number of cached entries (for health endpoint)."""
+        return len(self._cache)
+
     async def get_debug_info(self) -> list[dict]:
         """
         Return cache keys and freshness for /debug/cache endpoint.
