@@ -1,148 +1,153 @@
 """
-Nuunipay Signals Bot - Production-ready for Render
+Nuunipay Signals Bot - Production-ready FastAPI backend for Render.
 - Single global PocketOption client (no reconnect per request)
-- Background updater refreshes market data every few seconds
-- In-memory cache (asset:timeframe) returns instantly
-- Fallback to stale cache if live fetch fails
+- In-memory cache by asset:timeframe with configurable TTL
+- Background task precomputes signals for tracked assets
+- Fallback to stale cache when live fetch fails
+- Consistent JSON responses, structured error handling
 """
-import os
 import asyncio
-from datetime import datetime
-from typing import Literal
-
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
+
 from dotenv import load_dotenv
-
-from pocketoptionapi_async.client import AsyncPocketOptionClient
-from pocketoptionapi_async.constants import TIMEFRAMES
-
-from signal_cache import SignalCacheManager
 
 load_dotenv()
 
-PO_SSID = os.environ.get("PO_SSID")
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+
+from pocketoptionapi_async.constants import TIMEFRAMES
+from pocketoptionapi_async.exceptions import (
+    ConnectionError as POConnectionError,
+    InvalidParameterError,
+    PocketOptionError,
+)
+
+from client_manager import ensure_connected, get_client, is_connected
+from config import (
+    CACHE_TTL_SEC,
+    CANDLE_TIMEOUT_SEC,
+    DEFAULT_CANDLE_COUNT,
+    MIN_CANDLES_FOR_SIGNAL,
+    PO_SSID,
+    REFRESH_INTERVAL_SEC,
+    TRACKED_ASSETS,
+    TRACKED_TIMEFRAMES,
+)
+from signal_cache import SignalCacheManager
+from signal_logic import compute_signal
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
 if not PO_SSID:
     raise RuntimeError(
         "PO_SSID environment variable not set. "
         "Export your full auth string 42[\"auth\",{...}] into PO_SSID."
     )
 
-# Tracked assets and timeframes - refreshed in background
-TRACKED_ASSETS = [
-    "EURUSD_otc",
-    "USDCHF_otc",
-    "AUDUSD_otc",
-    "GBPUSD_otc",
-    "USDJPY_otc",
-    "USDCAD_otc",
-    "AUDCAD_otc",
-    "XAUUSD_otc",
-    "XAGUSD_otc",
-]
-TRACKED_TIMEFRAMES = ["1m", "5m"]
-REFRESH_INTERVAL_SEC = 5
-CACHE_TTL_SEC = 5
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("nuunipay.signals")
 
-client: AsyncPocketOptionClient | None = None
-_client_lock = asyncio.Lock()
 signal_cache = SignalCacheManager(ttl_sec=CACHE_TTL_SEC)
 _background_task: asyncio.Task | None = None
 
 
-def decide_direction(df) -> tuple[Literal["buy", "sell", "neutral"], int, str]:
-    if df is None or df.empty or len(df) < 3:
-        return "neutral", 0, "Not enough data"
-
-    last_two = df.tail(3).iloc[:-1]
-    c_prev = last_two.iloc[0]
-    c_last = last_two.iloc[1]
-
-    if c_last["close"] > c_prev["close"]:
-        direction = "buy"
-    elif c_last["close"] < c_prev["close"]:
-        direction = "sell"
-    else:
-        direction = "neutral"
-
-    recent = df.tail(20)
-    bodies = (recent["close"] - recent["open"]).abs()
-    avg_body = bodies.mean() or 0.00001
-    last_body = abs(c_last["close"] - c_last["open"])
-    ratio = float(last_body / avg_body)
-
-    if ratio >= 1.8:
-        conf = 85
-    elif ratio >= 1.2:
-        conf = 70
-    else:
-        conf = 55 if direction != "neutral" else 40
-
-    msg = f"Second candle suggests {direction.upper()} (body ratio {ratio:.2f})"
-    return direction, conf, msg
-
-
-async def get_client() -> AsyncPocketOptionClient:
-    """Single global client - never reconnect on every request."""
-    global client
-    async with _client_lock:
-        if client is None or not client.is_connected:
-            client = AsyncPocketOptionClient(
-                ssid=PO_SSID,
-                is_demo=True,
-                persistent_connection=True,
-                auto_reconnect=True,
-            )
-            ok = await client.connect()
-            if not ok:
-                raise RuntimeError("Failed to connect to PocketOption")
-        return client
-
-
-async def _compute_signal(asset: str, timeframe: str, count: int = 100) -> dict | None:
+# ---------------------------------------------------------------------------
+# Signal computation
+# ---------------------------------------------------------------------------
+async def _compute_signal(
+    asset: str, timeframe: str, count: int = DEFAULT_CANDLE_COUNT
+) -> dict | None:
+    """Fetch candles, compute signal, return standardized dict or None on failure."""
     try:
         cli = await get_client()
-        df = await cli.get_candles_dataframe(
-            asset, timeframe, count=count, end_time=datetime.now()
+        df = await asyncio.wait_for(
+            cli.get_candles_dataframe(
+                asset, timeframe, count=count, end_time=datetime.now()
+            ),
+            timeout=CANDLE_TIMEOUT_SEC,
         )
-        direction, confidence, message = decide_direction(df)
+        direction, confidence, message = compute_signal(
+            df, min_candles=MIN_CANDLES_FOR_SIGNAL
+        )
         return {
             "asset": asset,
             "timeframe": timeframe,
             "direction": direction,
             "confidence": confidence,
             "message": message,
-            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "generated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
             "cached": False,
         }
-    except Exception:
+    except asyncio.TimeoutError:
+        logger.warning("Candle fetch timeout for %s %s", asset, timeframe)
+        return None
+    except POConnectionError as e:
+        logger.warning("Connection error for %s %s: %s", asset, timeframe, e)
+        return None
+    except InvalidParameterError as e:
+        logger.warning("Invalid parameter for %s %s: %s", asset, timeframe, e)
+        raise
+    except PocketOptionError as e:
+        logger.warning("PocketOption error for %s %s: %s", asset, timeframe, e)
+        return None
+    except Exception as e:
+        logger.exception("Unexpected error computing signal for %s %s", asset, timeframe)
         return None
 
 
 async def _background_refresh_loop():
-    """Continuously refresh market data and recalculate signals for tracked assets."""
+    """Periodically refresh signals for tracked asset/timeframe pairs."""
+    logger.info(
+        "Background refresh started: %d assets, %d timeframes, interval=%ds",
+        len(TRACKED_ASSETS),
+        len(TRACKED_TIMEFRAMES),
+        REFRESH_INTERVAL_SEC,
+    )
     while True:
         try:
+            if not await ensure_connected():
+                logger.warning("Background refresh: not connected, skipping cycle")
+                await asyncio.sleep(REFRESH_INTERVAL_SEC)
+                continue
+
             for asset in TRACKED_ASSETS:
                 for tf in TRACKED_TIMEFRAMES:
-                    result = await _compute_signal(asset, tf)
-                    if result:
-                        await signal_cache.set(asset, tf, result)
-        except Exception:
-            pass
+                    try:
+                        result = await _compute_signal(asset, tf)
+                        if result:
+                            await signal_cache.set(asset, tf, result)
+                    except InvalidParameterError:
+                        pass  # Skip invalid asset/tf
+                    except Exception as e:
+                        logger.debug("Background refresh %s %s: %s", asset, tf, e)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning("Background refresh error: %s", e)
+
         await asyncio.sleep(REFRESH_INTERVAL_SEC)
 
 
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: connect client and start background updater. Shutdown: cleanup."""
+    """Startup: connect client and start background refresh. Shutdown: cleanup."""
     global _background_task
     try:
-        await get_client()
+        await ensure_connected()
         _background_task = asyncio.create_task(_background_refresh_loop())
-    except Exception:
-        pass
+        logger.info("Nuunipay Signals Bot started")
+    except Exception as e:
+        logger.error("Startup failed: %s", e)
     yield
     if _background_task:
         _background_task.cancel()
@@ -150,9 +155,29 @@ async def lifespan(app: FastAPI):
             await _background_task
         except asyncio.CancelledError:
             pass
+    logger.info("Nuunipay Signals Bot stopped")
 
 
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
 app = FastAPI(title="Nuunipay Signals Bot", lifespan=lifespan)
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    """Never expose tracebacks to frontend - return clean error."""
+    from fastapi import HTTPException as FastAPIHTTPException
+    from fastapi.responses import JSONResponse
+
+    if isinstance(exc, FastAPIHTTPException):
+        raise exc
+    logger.exception("Unhandled error: %s", exc)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error. Please try again later."},
+    )
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -162,28 +187,54 @@ app.add_middleware(
 )
 
 
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 @app.get("/")
 async def root():
-    """Warm root endpoint - keeps Render instance alive."""
-    return {"service": "Nuunipay Signals Bot", "status": "running"}
+    """Root endpoint - basic status."""
+    return {"status": "running"}
 
 
 @app.get("/health")
 async def health():
-    """Lightweight health check."""
+    """Health check - connection status."""
     try:
-        cli = await get_client()
-        return {"status": "ok", "connected": cli.is_connected}
+        connected = is_connected()
+        if not connected:
+            connected = await ensure_connected()
+        return {"status": "ok" if connected else "degraded", "connected": connected}
     except Exception as e:
-        return {"status": "degraded", "error": str(e)}
+        return {"status": "error", "connected": False, "error": str(e)}
+
+
+@app.get("/debug/cache")
+async def debug_cache():
+    """Show cache keys and freshness (no secrets)."""
+    items = await signal_cache.get_debug_info()
+    return {"keys": items, "ttl_sec": CACHE_TTL_SEC}
+
+
+@app.get("/tracked-assets")
+async def tracked_assets():
+    """Return currently tracked assets and timeframes."""
+    return {
+        "assets": TRACKED_ASSETS,
+        "timeframes": TRACKED_TIMEFRAMES,
+        "refresh_interval_sec": REFRESH_INTERVAL_SEC,
+    }
 
 
 @app.get("/signal")
 async def get_signal(
     asset: str = Query(..., description="PocketOption asset, e.g. EURUSD_otc"),
-    timeframe: str = Query("1m", description="1m,5m,15m,1h,4h"),
-    count: int = Query(100, ge=10, le=500),
+    timeframe: str = Query("1m", description="1m, 5m, 15m, 1h, 4h"),
+    count: int = Query(DEFAULT_CANDLE_COUNT, ge=10, le=500),
 ):
+    """
+    Get trading signal for asset/timeframe.
+    Returns cached result if fresh; otherwise fetches live or falls back to stale cache.
+    """
     if timeframe not in TIMEFRAMES:
         raise HTTPException(status_code=400, detail="Invalid timeframe")
 
@@ -199,8 +250,10 @@ async def get_signal(
             result["cached"] = False
             await signal_cache.set(asset, timeframe, result)
             return result
-    except Exception:
-        pass
+    except InvalidParameterError as e:
+        raise HTTPException(status_code=400, detail="Invalid asset or timeframe")
+    except Exception as e:
+        logger.warning("Live signal fetch failed for %s %s: %s", asset, timeframe, e)
 
     # 3. Fallback: return last cached (even if stale)
     stale = await signal_cache.get_stale(asset, timeframe)
@@ -213,6 +266,9 @@ async def get_signal(
     )
 
 
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
 

@@ -49,5 +49,23 @@ class SignalCacheManager:
         """Get last cached result even if expired (fallback when live fetch fails)."""
         return await self.get(asset, timeframe, allow_stale=True)
 
+    async def get_debug_info(self) -> list[dict]:
+        """
+        Return cache keys and freshness for /debug/cache endpoint.
+        No secrets exposed - only key, age_sec, is_fresh.
+        """
+        async with self._lock:
+            now = datetime.utcnow()
+            items = []
+            for k, entry in self._cache.items():
+                cached_at = entry.get("_cached_at")
+                if cached_at:
+                    age_sec = (now - cached_at).total_seconds()
+                    is_fresh = age_sec <= self._ttl_sec
+                    items.append({"key": k, "age_sec": round(age_sec, 1), "fresh": is_fresh})
+                else:
+                    items.append({"key": k, "age_sec": None, "fresh": True})
+        return items
+
     def _to_response(self, entry: dict) -> dict:
         return {k: v for k, v in entry.items() if not k.startswith("_")}
