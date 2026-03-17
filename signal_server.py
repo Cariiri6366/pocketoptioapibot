@@ -66,7 +66,7 @@ async def _compute_signal(
 ) -> dict | None:
     """Fetch candles, compute signal, return standardized dict or None on failure."""
     try:
-        cli = await get_client()
+        cli = await asyncio.wait_for(get_client(), timeout=25.0)
         df = await asyncio.wait_for(
             cli.get_candles_dataframe(
                 asset, timeframe, count=count, end_time=datetime.now()
@@ -86,7 +86,7 @@ async def _compute_signal(
             "cached": False,
         }
     except asyncio.TimeoutError:
-        logger.warning("Candle fetch timeout for %s %s", asset, timeframe)
+        logger.warning("Candle fetch or connection timeout for %s %s", asset, timeframe)
         return None
     except POConnectionError as e:
         logger.warning("Connection error for %s %s: %s", asset, timeframe, e)

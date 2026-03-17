@@ -1001,8 +1001,8 @@ class AsyncPocketOptionClient:
             await self._websocket.send_message(message)
 
         try:
-            # Wait for the response (with timeout)
-            candles = await asyncio.wait_for(candle_future, timeout=10.0)
+            # Wait for the response (with timeout - 15s for slow connections)
+            candles = await asyncio.wait_for(candle_future, timeout=15.0)
             return candles
         except asyncio.TimeoutError:
             if self.enable_logging:
@@ -1363,11 +1363,11 @@ class AsyncPocketOptionClient:
             try:
                 # Parse the message (remove the 42 prefix and parse JSON)
                 data_str = message[2:]
-                data = json.loads(data_str)
+                parsed = json.loads(data_str)
 
-                if isinstance(data, list) and len(data) >= 2:
-                    event_type = data[0]
-                    event_data = data[1]
+                if isinstance(parsed, list) and len(parsed) >= 2:
+                    event_type = parsed[0]
+                    event_data = parsed[1]
 
                     # Process different event types
                     if event_type == "authenticated":
@@ -1382,6 +1382,10 @@ class AsyncPocketOptionClient:
                         await self._on_order_closed(event_data)
                     elif event_type == "stream_update":
                         await self._on_stream_update(event_data)
+                    elif isinstance(event_data, dict) and "candles" in event_data:
+                        await self._on_json_data(event_data)
+                elif isinstance(parsed, dict) and "candles" in parsed:
+                    await self._on_json_data(parsed)
             except Exception as e:
                 logger.error(f"Error processing keep-alive message: {e}")
 
