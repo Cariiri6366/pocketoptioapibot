@@ -74,4 +74,6 @@ class SignalCacheManager:
             out["source"] = "memory_cache"
         if "firestore_fallback" not in out:
             out["firestore_fallback"] = False
+        if "fallback" not in out:
+            out["fallback"] = False
         return out

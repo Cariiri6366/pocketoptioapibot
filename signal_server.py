@@ -252,16 +252,34 @@ async def root():
     return {"status": "running"}
 
 
+@app.get("/warm")
+async def warm():
+    """
+    Lightweight warm-up endpoint. Keeps Render from sleeping.
+    Returns quickly without full PocketOption connection.
+    """
+    return {"status": "ok", "warm": True}
+
+
 @app.get("/health")
 async def health():
-    """Health check - connection status."""
+    """Health check - connection status. Does not crash on failure."""
     try:
         connected = is_connected()
         if not connected:
-            connected = await ensure_connected()
-        return {"status": "ok" if connected else "degraded", "connected": connected}
+            try:
+                connected = await asyncio.wait_for(ensure_connected(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("Health check: ensure_connected timed out")
+                connected = False
+        return {
+            "status": "ok" if connected else "degraded",
+            "connected": connected,
+            "warm": True,
+        }
     except Exception as e:
-        return {"status": "error", "connected": False, "error": str(e)}
+        logger.warning("Health check failed: %s", e)
+        return {"status": "error", "connected": False, "warm": True}
 
 
 @app.get("/debug/cache")
@@ -295,24 +313,33 @@ async def get_signal(
     if timeframe not in TIMEFRAMES:
         raise HTTPException(status_code=400, detail="Invalid timeframe")
 
+    def _enrich(data: dict, source: str, cached: bool, fallback: bool) -> dict:
+        """Ensure consistent response fields."""
+        out = dict(data)
+        out["source"] = source
+        out["cached"] = cached
+        out["fallback"] = fallback
+        out.setdefault("firestore_fallback", source == "firestore_fallback")
+        return out
+
     # 1. Return memory cache immediately if fresh
     cached = await signal_cache.get(asset, timeframe)
     if cached:
-        cached["source"] = "memory_cache"
-        cached["firestore_fallback"] = False
-        return cached
+        return _enrich(cached, "memory_cache", cached=True, fallback=False)
 
     # 2. Try Firestore fallback if enabled and memory cache miss
     fs_signal = get_latest_signal(asset, timeframe, max_age_sec=FIRESTORE_LATEST_TTL_SEC)
     if fs_signal:
-        return fs_signal
+        return _enrich(fs_signal, "firestore_fallback", cached=True, fallback=True)
 
-    # 3. Try live fetch
+    # 3. Try live fetch (do not fail fast - fallbacks are tried after)
+    result = None
     try:
         result = await _compute_signal(asset, timeframe, count)
         if result:
             result["cached"] = False
             result["firestore_fallback"] = False
+            result["fallback"] = False
             result["source"] = "live"
             await signal_cache.set(asset, timeframe, result)
             save_latest_signal(asset, timeframe, result, source="live", is_demo=IS_DEMO)
@@ -326,15 +353,15 @@ async def get_signal(
     # 4. Fallback: Firestore again (ignore TTL - last resort)
     fs_stale = get_latest_signal(asset, timeframe, max_age_sec=86400)
     if fs_stale:
-        return fs_stale
+        return _enrich(fs_stale, "firestore_fallback", cached=True, fallback=True)
 
     # 5. Fallback: return last memory cached (even if stale)
     stale = await signal_cache.get_stale(asset, timeframe)
     if stale:
-        stale["source"] = "memory_cache"
-        stale["firestore_fallback"] = False
-        return stale
+        return _enrich(stale, "memory_cache", cached=True, fallback=True)
 
+    # 6. Only return 503 when ALL fallbacks exhausted
+    logger.info("Signal unavailable for %s %s: no cache, no Firestore, live failed", asset, timeframe)
     raise HTTPException(
         status_code=503,
         detail="Signal unavailable. Server may be warming up. Please retry.",
