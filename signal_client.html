@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PocketOption Signal Client</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #050816;
+        --bg-elevated: #0f172a;
+        --accent: #38bdf8;
+        --accent-soft: rgba(56, 189, 248, 0.1);
+        --text: #e5e7eb;
+        --muted: #9ca3af;
+        --danger: #f97373;
+        --buy: #22c55e;
+        --sell: #f97316;
+        --neutral: #6b7280;
+        --border-subtle: rgba(148, 163, 184, 0.4);
+        --shadow-soft: 0 18px 45px rgba(15, 23, 42, 0.8);
+        --radius-lg: 18px;
+        --radius-pill: 999px;
+        --transition-fast: 0.18s ease-out;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 24px;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
+          sans-serif;
+        background: radial-gradient(circle at top, #1d4ed8 0, transparent 55%),
+          radial-gradient(circle at bottom, #22c55e 0, transparent 55%),
+          var(--bg);
+        color: var(--text);
+      }
+
+      .card {
+        width: 100%;
+        max-width: 520px;
+        background: linear-gradient(145deg, #020617, #020617);
+        border-radius: 26px;
+        padding: 22px 22px 20px;
+        box-shadow: var(--shadow-soft);
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        position: relative;
+        overflow: hidden;
+      }
+
+      .card::before {
+        content: "";
+        position: absolute;
+        inset: -120px;
+        background:
+          radial-gradient(circle at 0% 0%, rgba(56, 189, 248, 0.15), transparent 60%),
+          radial-gradient(circle at 100% 0%, rgba(34, 197, 94, 0.1), transparent 55%);
+        opacity: 0.7;
+        pointer-events: none;
+      }
+
+      .card-inner {
+        position: relative;
+        z-index: 1;
+      }
+
+      .card-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 18px;
+      }
+
+      .title-group {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+
+      .title {
+        font-size: 1.1rem;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .badge-live {
+        font-size: 0.7rem;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        padding: 2px 9px;
+        border-radius: var(--radius-pill);
+        border: 1px solid rgba(45, 212, 191, 0.7);
+        color: #a5f3fc;
+        background: rgba(15, 118, 110, 0.18);
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+      }
+
+      .badge-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #22c55e;
+        box-shadow: 0 0 0 5px rgba(34, 197, 94, 0.35);
+      }
+
+      .subtitle {
+        font-size: 0.78rem;
+        color: var(--muted);
+      }
+
+      .refresh-group {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 0.78rem;
+        color: var(--muted);
+      }
+
+      .switch {
+        position: relative;
+        width: 40px;
+        height: 22px;
+      }
+
+      .switch input {
+        opacity: 0;
+        width: 0;
+        height: 0;
+      }
+
+      .switch-slider {
+        position: absolute;
+        cursor: pointer;
+        inset: 0;
+        background: rgba(15, 23, 42, 0.9);
+        border-radius: var(--radius-pill);
+        border: 1px solid rgba(148, 163, 184, 0.7);
+        transition: background var(--transition-fast),
+          border-color var(--transition-fast);
+      }
+
+      .switch-slider::before {
+        content: "";
+        position: absolute;
+        height: 16px;
+        width: 16px;
+        left: 3px;
+        top: 50%;
+        transform: translateY(-50%);
+        border-radius: 50%;
+        background: radial-gradient(circle at 30% 30%, #e5e7eb, #9ca3af);
+        transition: transform var(--transition-fast);
+        box-shadow: 0 3px 8px rgba(15, 23, 42, 0.9);
+      }
+
+      .switch input:checked + .switch-slider {
+        background: radial-gradient(circle at 0% 0%, #22c55e, #16a34a);
+        border-color: transparent;
+      }
+
+      .switch input:checked + .switch-slider::before {
+        transform: translate(16px, -50%);
+      }
+
+      .inputs-row {
+        display: flex;
+        gap: 10px;
+        margin-bottom: 16px;
+      }
+
+      .field {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+
+      .label {
+        font-size: 0.72rem;
+        text-transform: uppercase;
+        letter-spacing: 0.14em;
+        color: var(--muted);
+      }
+
+      input,
+      select {
+        border-radius: 999px;
+        border: 1px solid var(--border-subtle);
+        padding: 8px 12px;
+        font-size: 0.86rem;
+        background: rgba(15, 23, 42, 0.95);
+        color: var(--text);
+        outline: none;
+        transition: border-color var(--transition-fast),
+          box-shadow var(--transition-fast),
+          background-color var(--transition-fast),
+          transform var(--transition-fast);
+      }
+
+      input::placeholder {
+        color: #6b7280;
+      }
+
+      input:focus,
+      select:focus {
+        border-color: rgba(56, 189, 248, 0.9);
+        box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.35);
+        transform: translateY(-0.5px);
+      }
+
+      button {
+        border-radius: var(--radius-pill);
+        border: none;
+        padding: 9px 18px;
+        font-size: 0.86rem;
+        font-weight: 500;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        background: radial-gradient(circle at 0% 0%, #38bdf8, #3b82f6);
+        color: #e5f4ff;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        white-space: nowrap;
+        box-shadow: 0 12px 28px rgba(37, 99, 235, 0.5);
+        transition: transform var(--transition-fast),
+          box-shadow var(--transition-fast),
+          filter var(--transition-fast),
+          opacity var(--transition-fast);
+      }
+
+      button:hover:not(:disabled) {
+        transform: translateY(-1px);
+        filter: brightness(1.05);
+        box-shadow: 0 16px 40px rgba(37, 99, 235, 0.6);
+      }
+
+      button:active:not(:disabled) {
+        transform: translateY(0);
+        box-shadow: 0 10px 22px rgba(15, 23, 42, 0.9);
+      }
+
+      button:disabled {
+        opacity: 0.7;
+        cursor: default;
+        box-shadow: none;
+      }
+
+      .button-icon {
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        border: 2px solid rgba(15, 23, 42, 0.9);
+        border-top-color: transparent;
+        animation: spin 0.9s linear infinite;
+      }
+
+      .button-icon.idle {
+        animation: none;
+        border-width: 0;
+        width: 6px;
+        height: 12px;
+        border-radius: 0;
+        border-left: 2px solid rgba(15, 23, 42, 0.95);
+        border-bottom: 2px solid rgba(15, 23, 42, 0.95);
+        transform: rotate(-45deg) translateY(-1px);
+      }
+
+      .results-card {
+        border-radius: var(--radius-lg);
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        background: radial-gradient(circle at 0% 0%, rgba(56, 189, 248, 0.1), transparent 55%),
+          radial-gradient(circle at 100% 100%, rgba(34, 197, 94, 0.1), transparent 55%),
+          rgba(15, 23, 42, 0.95);
+        padding: 14px 14px 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        position: relative;
+        overflow: hidden;
+      }
+
+      .results-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+
+      .asset-tag {
+        font-size: 0.8rem;
+        padding: 4px 10px;
+        border-radius: var(--radius-pill);
+        background: rgba(15, 23, 42, 0.9);
+        border: 1px solid rgba(148, 163, 184, 0.6);
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        color: #e5e7eb;
+      }
+
+      .asset-tag span {
+        font-size: 0.7rem;
+        text-transform: uppercase;
+        letter-spacing: 0.16em;
+        color: var(--muted);
+      }
+
+      .time-pill {
+        font-size: 0.75rem;
+        padding: 4px 9px;
+        border-radius: var(--radius-pill);
+        background: rgba(15, 23, 42, 0.85);
+        border: 1px solid rgba(148, 163, 184, 0.4);
+        color: var(--muted);
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .time-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #38bdf8;
+      }
+
+      .direction-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+      }
+
+      .direction-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 9px;
+        padding: 6px 14px;
+        border-radius: var(--radius-pill);
+        border: 1px solid transparent;
+        font-size: 0.86rem;
+        font-weight: 500;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .direction-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        box-shadow: 0 0 0 6px rgba(34, 197, 94, 0.22);
+      }
+
+      .direction-pill.buy {
+        background: radial-gradient(circle at 0% 0%, rgba(22, 163, 74, 0.18), transparent 70%);
+        border-color: rgba(34, 197, 94, 0.7);
+        color: #bbf7d0;
+      }
+
+      .direction-pill.buy .direction-dot {
+        background: var(--buy);
+        box-shadow: 0 0 0 6px rgba(34, 197, 94, 0.22);
+      }
+
+      .direction-pill.sell {
+        background: radial-gradient(circle at 0% 0%, rgba(220, 38, 38, 0.18), transparent 70%);
+        border-color: rgba(248, 113, 113, 0.9);
+        color: #fecaca;
+      }
+
+      .direction-pill.sell .direction-dot {
+        background: var(--sell);
+        box-shadow: 0 0 0 6px rgba(248, 113, 113, 0.3);
+      }
+
+      .direction-pill.neutral {
+        background: radial-gradient(circle at 0% 0%, rgba(148, 163, 184, 0.2), transparent 70%);
+        border-color: rgba(148, 163, 184, 0.85);
+        color: #e5e7eb;
+      }
+
+      .direction-pill.neutral .direction-dot {
+        background: var(--neutral);
+        box-shadow: 0 0 0 6px rgba(148, 163, 184, 0.32);
+      }
+
+      .confidence-wrap {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 3px;
+      }
+
+      .confidence-label {
+        font-size: 0.7rem;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: var(--muted);
+      }
+
+      .confidence-value {
+        font-size: 0.96rem;
+        font-weight: 600;
+      }
+
+      .confidence-bar {
+        width: 110px;
+        height: 6px;
+        border-radius: 999px;
+        background: rgba(15, 23, 42, 0.9);
+        border: 1px solid rgba(148, 163, 184, 0.5);
+        overflow: hidden;
+      }
+
+      .confidence-bar-inner {
+        height: 100%;
+        width: 0%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, #f97316, #facc15, #22c55e);
+        transition: width 0.4s ease-out;
+      }
+
+      .message {
+        font-size: 0.84rem;
+        color: var(--muted);
+        line-height: 1.5;
+        padding-top: 4px;
+      }
+
+      .meta-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-size: 0.72rem;
+        color: var(--muted);
+        margin-top: 2px;
+      }
+
+      .status-chip {
+        padding: 3px 9px;
+        border-radius: var(--radius-pill);
+        border: 1px solid rgba(148, 163, 184, 0.6);
+        background: rgba(15, 23, 42, 0.85);
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .status-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #22c55e;
+      }
+
+      .error {
+        margin-top: 10px;
+        font-size: 0.8rem;
+        color: #fecaca;
+        padding: 8px 10px;
+        border-radius: 12px;
+        border: 1px solid rgba(248, 113, 113, 0.8);
+        background: rgba(127, 29, 29, 0.7);
+        display: none;
+      }
+
+      .error.visible {
+        display: block;
+      }
+
+      .skeleton {
+        position: absolute;
+        inset: 0;
+        border-radius: inherit;
+        background: linear-gradient(
+          110deg,
+          rgba(15, 23, 42, 0.95) 8%,
+          rgba(30, 64, 175, 0.7) 18%,
+          rgba(15, 23, 42, 0.95) 33%
+        );
+        background-size: 200% 100%;
+        animation: shimmer 1.3s infinite;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.22s ease-out;
+      }
+
+      .skeleton.visible {
+        opacity: 1;
+      }
+
+      .empty-state {
+        font-size: 0.82rem;
+        color: var(--muted);
+        text-align: center;
+        padding: 20px 10px;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+
+      @keyframes shimmer {
+        0% {
+          background-position: -200% 0;
+        }
+        100% {
+          background-position: 200% 0;
+        }
+      }
+
+      @media (max-width: 600px) {
+        .card {
+          padding: 18px 16px 16px;
+        }
+
+        .inputs-row {
+          flex-direction: column;
+        }
+
+        .direction-row {
+          flex-direction: column;
+          align-items: flex-start;
+        }
+
+        .confidence-wrap {
+          align-items: flex-start;
+        }
+
+        .confidence-bar {
+          width: 100%;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="card-inner">
+        <div class="card-header">
+          <div class="title-group">
+            <div class="title">
+              PocketOption Signal
+              <span class="badge-live">
+                <span class="badge-dot"></span>
+                Live feed
+              </span>
+            </div>
+            <div class="subtitle">
+              Enter an asset like <code>EURUSD_otc</code> to fetch the latest
+              signal.
+            </div>
+          </div>
+          <div class="refresh-group">
+            <label class="switch">
+              <input type="checkbox" id="autoRefreshToggle" checked />
+              <span class="switch-slider"></span>
+            </label>
+            <span>Auto refresh 10s</span>
+          </div>
+        </div>
+
+        <div class="inputs-row">
+          <div class="field">
+            <label class="label" for="assetInput">Asset</label>
+            <input
+              id="assetInput"
+              type="text"
+              placeholder="EURUSD_otc"
+              value="EURUSD_otc"
+              autocomplete="off"
+            />
+          </div>
+          <div class="field">
+            <label class="label" for="timeframeSelect">Timeframe</label>
+            <select id="timeframeSelect">
+              <option value="1m" selected>1m</option>
+              <option value="5m">5m</option>
+              <option value="15m">15m</option>
+              <option value="1h">1h</option>
+              <option value="4h">4h</option>
+            </select>
+          </div>
+          <div class="field" style="flex: 0 0 auto">
+            <label class="label">&nbsp;</label>
+            <button id="fetchButton">
+              <span class="button-icon idle" id="buttonIcon"></span>
+              <span id="buttonLabel">Refresh</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="results-card">
+          <div class="skeleton" id="resultsSkeleton"></div>
+
+          <div id="resultsContent">
+            <div class="empty-state" id="emptyState">
+              Waiting for first signal. Hit refresh or keep auto-refresh on.
+            </div>
+
+            <div id="signalDetails" style="display: none">
+              <div class="results-header">
+                <div class="asset-tag">
+                  <span>ASSET</span>
+                  <strong id="assetLabel">-</strong>
+                </div>
+                <div class="time-pill">
+                  <span class="time-dot"></span>
+                  <span id="timeframeLabel">1m</span>
+                </div>
+              </div>
+
+              <div class="direction-row">
+                <div class="direction-pill neutral" id="directionPill">
+                  <span class="direction-dot"></span>
+                  <span id="directionLabel">NEUTRAL</span>
+                </div>
+                <div class="confidence-wrap">
+                  <div class="confidence-label">Confidence</div>
+                  <div class="confidence-value" id="confidenceLabel">0%</div>
+                  <div class="confidence-bar">
+                    <div
+                      class="confidence-bar-inner"
+                      id="confidenceBarInner"
+                    ></div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="message" id="messageText">
+                &mdash;
+              </div>
+
+              <div class="meta-row">
+                <div>Last updated: <span id="lastUpdated">–</span></div>
+                <div class="status-chip">
+                  <span class="status-dot" id="statusDot"></span>
+                  <span id="statusText">Connected</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="error" id="errorBox"></div>
+      </div>
+    </div>
+
+    <script>
+      const API_BASE =
+        "https://pocketoptioapibot-1.onrender.com"; // required base
+
+      const assetInput = document.getElementById("assetInput");
+      const timeframeSelect = document.getElementById("timeframeSelect");
+      const fetchButton = document.getElementById("fetchButton");
+      const buttonIcon = document.getElementById("buttonIcon");
+      const buttonLabel = document.getElementById("buttonLabel");
+      const autoRefreshToggle = document.getElementById("autoRefreshToggle");
+
+      const resultsSkeleton = document.getElementById("resultsSkeleton");
+      const emptyState = document.getElementById("emptyState");
+      const signalDetails = document.getElementById("signalDetails");
+
+      const assetLabel = document.getElementById("assetLabel");
+      const timeframeLabel = document.getElementById("timeframeLabel");
+      const directionPill = document.getElementById("directionPill");
+      const directionLabel = document.getElementById("directionLabel");
+      const confidenceLabel = document.getElementById("confidenceLabel");
+      const confidenceBarInner = document.getElementById("confidenceBarInner");
+      const messageText = document.getElementById("messageText");
+      const lastUpdated = document.getElementById("lastUpdated");
+      const statusDot = document.getElementById("statusDot");
+      const statusText = document.getElementById("statusText");
+      const errorBox = document.getElementById("errorBox");
+
+      let isLoading = false;
+      let autoRefreshId = null;
+
+      function setLoading(loading) {
+        isLoading = loading;
+        if (loading) {
+          buttonIcon.classList.remove("idle");
+          buttonLabel.textContent = "Loading...";
+          resultsSkeleton.classList.add("visible");
+          fetchButton.disabled = true;
+          errorBox.classList.remove("visible");
+        } else {
+          buttonIcon.classList.add("idle");
+          buttonLabel.textContent = "Refresh";
+          resultsSkeleton.classList.remove("visible");
+          fetchButton.disabled = false;
+        }
+      }
+
+      function setStatus(ok, text) {
+        statusText.textContent = text;
+        statusDot.style.backgroundColor = ok ? "#22c55e" : "#f97373";
+      }
+
+      function setError(message) {
+        if (!message) {
+          errorBox.classList.remove("visible");
+          errorBox.textContent = "";
+          return;
+        }
+        errorBox.textContent = message;
+        errorBox.classList.add("visible");
+        setStatus(false, "Error");
+      }
+
+      function formatTime(date) {
+        return date.toLocaleTimeString(undefined, {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        });
+      }
+
+      function applyDirectionStyle(direction) {
+        directionPill.classList.remove("buy", "sell", "neutral");
+        const dir = (direction || "neutral").toLowerCase();
+        if (dir === "buy") {
+          directionPill.classList.add("buy");
+        } else if (dir === "sell") {
+          directionPill.classList.add("sell");
+        } else {
+          directionPill.classList.add("neutral");
+        }
+        directionLabel.textContent = dir.toUpperCase();
+      }
+
+      async function fetchSignal() {
+        const asset = assetInput.value.trim();
+        const timeframe = timeframeSelect.value;
+
+        if (!asset) {
+          setError("Please enter an asset, for example EURUSD_otc.");
+          return;
+        }
+
+        const url = `${API_BASE}/signal?asset=${encodeURIComponent(
+          asset
+        )}&timeframe=${encodeURIComponent(timeframe)}`;
+
+        setLoading(true);
+        setError(null);
+
+        try {
+          const response = await fetch(url, {
+            method: "GET",
+            headers: {
+              Accept: "application/json",
+            },
+          });
+
+          if (!response.ok) {
+            let message = `Request failed with status ${response.status}.`;
+            try {
+              const errBody = await response.json();
+              if (errBody && errBody.detail) {
+                message = errBody.detail;
+              }
+            } catch (_) {
+              // ignore JSON parse errors
+            }
+            throw new Error(message);
+          }
+
+          const data = await response.json();
+
+          if (!data || typeof data !== "object") {
+            throw new Error("Unexpected response from server.");
+          }
+
+          const {
+            asset: respAsset,
+            timeframe: respTimeframe,
+            direction,
+            confidence,
+            message,
+          } = data;
+
+          emptyState.style.display = "none";
+          signalDetails.style.display = "block";
+
+          assetLabel.textContent = respAsset || asset;
+          timeframeLabel.textContent = respTimeframe || timeframe;
+
+          applyDirectionStyle(direction);
+
+          const confVal =
+            typeof confidence === "number" && confidence >= 0
+              ? Math.min(confidence, 100)
+              : 0;
+          confidenceLabel.textContent = `${confVal}%`;
+          confidenceBarInner.style.width = `${confVal}%`;
+
+          messageText.textContent = message || "No message provided.";
+
+          lastUpdated.textContent = formatTime(new Date());
+          setStatus(true, "Connected");
+        } catch (err) {
+          console.error(err);
+          setError(err.message || "Failed to fetch signal. Please try again.");
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      function setupAutoRefresh() {
+        if (autoRefreshId) {
+          clearInterval(autoRefreshId);
+          autoRefreshId = null;
+        }
+        if (autoRefreshToggle.checked) {
+          autoRefreshId = setInterval(() => {
+            if (!isLoading) {
+              fetchSignal();
+            }
+          }, 10000);
+        }
+      }
+
+      fetchButton.addEventListener("click", () => {
+        fetchSignal();
+      });
+
+      assetInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          fetchSignal();
+        }
+      });
+
+      autoRefreshToggle.addEventListener("change", () => {
+        setupAutoRefresh();
+      });
+
+      // initial fetch + start auto refresh
+      fetchSignal();
+      setupAutoRefresh();
+    </script>
+  </body>
+  </html>
+
