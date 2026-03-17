@@ -1,0 +1,10 @@
+# Render.com deployment config for Nuunipay Signals Bot
+services:
+  - type: web
+    name: nuunipay-signals-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m uvicorn signal_server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PO_SSID
+        sync: false  # Set manually in Render dashboard

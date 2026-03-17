@@ -1,8 +1,9 @@
 """
-PocketOption Bot Signals API - Production-optimized
-- Keeps connection alive globally
-- Precomputes signals in background
-- Returns cached results instantly (1-3s target)
+Nuunipay Signals Bot - Production-ready for Render
+- Single global PocketOption client (no reconnect per request)
+- Background updater refreshes market data every few seconds
+- In-memory cache (asset:timeframe) returns instantly
+- Fallback to stale cache if live fetch fails
 """
 import os
 import asyncio
@@ -17,6 +18,8 @@ from dotenv import load_dotenv
 from pocketoptionapi_async.client import AsyncPocketOptionClient
 from pocketoptionapi_async.constants import TIMEFRAMES
 
+from signal_cache import SignalCacheManager
+
 load_dotenv()
 
 PO_SSID = os.environ.get("PO_SSID")
@@ -26,31 +29,26 @@ if not PO_SSID:
         "Export your full auth string 42[\"auth\",{...}] into PO_SSID."
     )
 
-# Precompute config - popular assets refreshed every 5s
-PREFETCH_ASSETS = [
+# Tracked assets and timeframes - refreshed in background
+TRACKED_ASSETS = [
     "EURUSD_otc",
+    "USDCHF_otc",
+    "AUDUSD_otc",
     "GBPUSD_otc",
     "USDJPY_otc",
-    "USDCHF_otc",
     "USDCAD_otc",
-    "AUDUSD_otc",
     "AUDCAD_otc",
     "XAUUSD_otc",
     "XAGUSD_otc",
 ]
-PREFETCH_TIMEFRAMES = ["1m", "5m"]
-PREFETCH_INTERVAL_SEC = 5
+TRACKED_TIMEFRAMES = ["1m", "5m"]
+REFRESH_INTERVAL_SEC = 5
 CACHE_TTL_SEC = 5
 
 client: AsyncPocketOptionClient | None = None
 _client_lock = asyncio.Lock()
-_signal_cache: dict[str, dict] = {}
-_cache_lock = asyncio.Lock()
-_precompute_task: asyncio.Task | None = None
-
-
-def _cache_key(asset: str, timeframe: str) -> str:
-    return f"{asset}|{timeframe}"
+signal_cache = SignalCacheManager(ttl_sec=CACHE_TTL_SEC)
+_background_task: asyncio.Task | None = None
 
 
 def decide_direction(df) -> tuple[Literal["buy", "sell", "neutral"], int, str]:
@@ -86,6 +84,7 @@ def decide_direction(df) -> tuple[Literal["buy", "sell", "neutral"], int, str]:
 
 
 async def get_client() -> AsyncPocketOptionClient:
+    """Single global client - never reconnect on every request."""
     global client
     async with _client_lock:
         if client is None or not client.is_connected:
@@ -121,59 +120,39 @@ async def _compute_signal(asset: str, timeframe: str, count: int = 100) -> dict 
         return None
 
 
-async def _precompute_loop():
-    """Background task: precompute signals for popular assets every few seconds."""
+async def _background_refresh_loop():
+    """Continuously refresh market data and recalculate signals for tracked assets."""
     while True:
         try:
-            for asset in PREFETCH_ASSETS:
-                for tf in PREFETCH_TIMEFRAMES:
+            for asset in TRACKED_ASSETS:
+                for tf in TRACKED_TIMEFRAMES:
                     result = await _compute_signal(asset, tf)
                     if result:
-                        result["cached"] = True
-                        key = _cache_key(asset, tf)
-                        async with _cache_lock:
-                            _signal_cache[key] = {
-                                **result,
-                                "_cached_at": datetime.utcnow(),
-                            }
+                        await signal_cache.set(asset, tf, result)
         except Exception:
             pass
-        await asyncio.sleep(PREFETCH_INTERVAL_SEC)
-
-
-async def _get_cached(asset: str, timeframe: str) -> dict | None:
-    key = _cache_key(asset, timeframe)
-    async with _cache_lock:
-        entry = _signal_cache.get(key)
-    if not entry:
-        return None
-    cached_at = entry.get("_cached_at")
-    if cached_at and (datetime.utcnow() - cached_at).total_seconds() > CACHE_TTL_SEC:
-        return None
-    out = {k: v for k, v in entry.items() if not k.startswith("_")}
-    out["cached"] = True
-    return out
+        await asyncio.sleep(REFRESH_INTERVAL_SEC)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: connect and start precompute. Shutdown: cleanup."""
-    global _precompute_task
+    """Startup: connect client and start background updater. Shutdown: cleanup."""
+    global _background_task
     try:
         await get_client()
-        _precompute_task = asyncio.create_task(_precompute_loop())
+        _background_task = asyncio.create_task(_background_refresh_loop())
     except Exception:
         pass
     yield
-    if _precompute_task:
-        _precompute_task.cancel()
+    if _background_task:
+        _background_task.cancel()
         try:
-            await _precompute_task
+            await _background_task
         except asyncio.CancelledError:
             pass
 
 
-app = FastAPI(title="PocketOption Bot Signals", lifespan=lifespan)
+app = FastAPI(title="Nuunipay Signals Bot", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -181,6 +160,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/")
+async def root():
+    """Warm root endpoint - keeps Render instance alive."""
+    return {"service": "Nuunipay Signals Bot", "status": "running"}
 
 
 @app.get("/health")
@@ -203,7 +188,7 @@ async def get_signal(
         raise HTTPException(status_code=400, detail="Invalid timeframe")
 
     # 1. Return cached immediately if fresh
-    cached = await _get_cached(asset, timeframe)
+    cached = await signal_cache.get(asset, timeframe)
     if cached:
         return cached
 
@@ -212,24 +197,15 @@ async def get_signal(
         result = await _compute_signal(asset, timeframe, count)
         if result:
             result["cached"] = False
-            key = _cache_key(asset, timeframe)
-            async with _cache_lock:
-                _signal_cache[key] = {
-                    **result,
-                    "_cached_at": datetime.utcnow(),
-                }
+            await signal_cache.set(asset, timeframe, result)
             return result
     except Exception:
         pass
 
-    # 3. Fallback: return stale cache if available
-    key = _cache_key(asset, timeframe)
-    async with _cache_lock:
-        entry = _signal_cache.get(key)
-    if entry:
-        out = {k: v for k, v in entry.items() if not k.startswith("_")}
-        out["cached"] = True
-        return out
+    # 3. Fallback: return last cached (even if stale)
+    stale = await signal_cache.get_stale(asset, timeframe)
+    if stale:
+        return stale
 
     raise HTTPException(
         status_code=503,
