@@ -20,8 +20,11 @@ REFRESH_INTERVAL_SEC = int(os.environ.get("SIGNAL_REFRESH_INTERVAL_SEC", "3"))
 # Default number of candles to fetch for signal calculation
 DEFAULT_CANDLE_COUNT = int(os.environ.get("SIGNAL_DEFAULT_CANDLE_COUNT", "150"))
 
-# Minimum candles required to produce a signal
-MIN_CANDLES_FOR_SIGNAL = 10
+# Minimum candles required (26 for MACD, RSI)
+MIN_CANDLES_FOR_SIGNAL = int(os.environ.get("SIGNAL_MIN_CANDLES", "26"))
+
+# Signal quality: minimum score (90 = strict 4/4 indicators, 75 = 3/4)
+SIGNAL_MIN_SCORE = int(os.environ.get("SIGNAL_MIN_SCORE", "90"))
 
 # Tracked assets: comma-separated list, or default (focused set for fast cycles)
 _TRACKED_STR = os.environ.get("SIGNAL_TRACKED_ASSETS", "").strip()
