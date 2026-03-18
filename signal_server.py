@@ -1,9 +1,8 @@
 """
-Nuunipay Signals Bot - Ultra-fast FastAPI backend for Render.
-- Background engine: precomputes signals every 3s (EURUSD, USDJPY, GBPUSD × 1m, 5m)
-- Memory cache: 5s TTL, instant response (<50ms) on cache hit
-- Single global PocketOption client (no reconnect per request)
-- Live requests: 3s timeout max - never block API
+Nuunipay Signals Bot - FastAPI backend for Railway/Render.
+- Background: sequential refresh with delay (avoids timeouts)
+- Memory cache: 15s TTL, keeps successful results longer
+- Live timeout: 10s (configurable) - allows real candle fetch
 - Fallback: cache → Firestore → live → stale cache → fallback_safe
 """
 import asyncio
@@ -28,6 +27,7 @@ from pocketoptionapi_async.exceptions import (
 
 from client_manager import ensure_connected, get_client, is_connected
 from config import (
+    BACKGROUND_FETCH_DELAY_SEC,
     CACHE_TTL_SEC,
     CANDLE_TIMEOUT_SEC,
     DEFAULT_CANDLE_COUNT,
@@ -158,48 +158,56 @@ def _maybe_append_history(asset: str, timeframe: str, result: dict) -> None:
 
 
 def _priority_pairs() -> list[tuple[str, str]]:
-    """Return (asset, timeframe) pairs in priority order: common pairs first for fast warm-up."""
-    priority_asset = "EURUSD_otc" if "EURUSD_otc" in TRACKED_ASSETS else (TRACKED_ASSETS[0] if TRACKED_ASSETS else "EURUSD_otc")
-    priority_tfs = [t for t in ["1m", "5m"] if t in TRACKED_TIMEFRAMES] or TRACKED_TIMEFRAMES
-    pairs = [(priority_asset, tf) for tf in priority_tfs]
+    """Return (asset, timeframe) pairs: EURUSD_otc 1m first for warm-up."""
+    priority = [("EURUSD_otc", "1m")]
+    seen = set(priority)
     for asset in TRACKED_ASSETS:
         for tf in TRACKED_TIMEFRAMES:
-            if (asset, tf) not in pairs:
-                pairs.append((asset, tf))
-    return pairs
+            if (asset, tf) not in seen:
+                seen.add((asset, tf))
+                priority.append((asset, tf))
+    return priority
 
 
-async def _refresh_one_pair(asset: str, tf: str) -> None:
-    """Refresh one asset/timeframe pair. Used by parallel background loop."""
+async def _refresh_one_pair(asset: str, tf: str) -> bool:
+    """Refresh one pair. Returns True if success."""
     try:
         result = await _compute_signal(asset, tf)
         if result:
             await signal_cache.set(asset, tf, result)
             save_latest_signal(asset, tf, result, source="live", is_demo=IS_DEMO)
             _maybe_append_history(asset, tf, result)
+            logger.info("Background live success: %s %s", asset, tf)
+            return True
     except InvalidParameterError:
         pass
     except Exception as e:
         logger.debug("Background refresh %s %s: %s", asset, tf, e)
+    return False
 
 
 async def _background_refresh_loop():
-    """Background engine: refresh all pairs in parallel every 3-5s. Pre-fills cache for instant API."""
+    """Background: sequential refresh with delay. Warm 1 pair first, avoid timeouts."""
     pairs = _priority_pairs()
     logger.info(
-        "Background signal engine: %d pairs, interval=%ds (instant cache-first API)",
+        "Background engine: %d pairs, interval=%ds, delay=%.1fs, live_timeout=%.0fs, candle_timeout=%.0fs",
         len(pairs),
         REFRESH_INTERVAL_SEC,
+        BACKGROUND_FETCH_DELAY_SEC,
+        LIVE_REQUEST_TIMEOUT_SEC,
+        CANDLE_TIMEOUT_SEC,
     )
     while True:
         try:
             if not await ensure_connected():
-                logger.warning("Background refresh: not connected, skipping cycle")
+                logger.warning("Background: not connected, skipping cycle")
                 await asyncio.sleep(REFRESH_INTERVAL_SEC)
                 continue
 
-            # Run all pairs in parallel for fast cache fill
-            await asyncio.gather(*[_refresh_one_pair(a, t) for a, t in pairs])
+            # Sequential fetch with delay (avoid hammering PocketOption)
+            for asset, tf in pairs:
+                await _refresh_one_pair(asset, tf)
+                await asyncio.sleep(BACKGROUND_FETCH_DELAY_SEC)
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -310,15 +318,21 @@ async def health():
 
 @app.get("/debug/cache")
 async def debug_cache():
-    """Show cache keys, freshness, and tracked assets (no secrets)."""
+    """Show cache keys, freshness, timeouts, and tracked pairs (no secrets)."""
     items = await signal_cache.get_debug_info()
+    pairs = _priority_pairs()
     return {
         "keys": items,
-        "ttl_sec": CACHE_TTL_SEC,
         "cache_size": signal_cache.size(),
+        "ttl_sec": CACHE_TTL_SEC,
+        "tracked_pairs": pairs,
+        "tracked_pairs_count": len(pairs),
         "tracked_assets": TRACKED_ASSETS,
         "tracked_timeframes": TRACKED_TIMEFRAMES,
         "refresh_interval_sec": REFRESH_INTERVAL_SEC,
+        "background_fetch_delay_sec": BACKGROUND_FETCH_DELAY_SEC,
+        "live_request_timeout_sec": LIVE_REQUEST_TIMEOUT_SEC,
+        "candle_timeout_sec": CANDLE_TIMEOUT_SEC,
     }
 
 
@@ -395,17 +409,22 @@ async def get_signal(
             fs_signal = get_latest_signal(asset, timeframe, max_age_sec=FIRESTORE_LATEST_TTL_SEC)
             if fs_signal:
                 resp = _enrich(fs_signal, "firestore_fallback", cached=True, fallback=False)
-                _log_source(asset, timeframe, "firestore_fallback")
+                logger.info("Firestore fallback hit: %s %s", asset, timeframe)
                 return resp
 
-        # Step 3: Live calculation - NEVER block long (timeout 3s)
+        # Step 3: Live calculation (timeout 10s - allows real candle fetch)
         try:
             result = await asyncio.wait_for(
                 _compute_signal(asset, timeframe, count),
                 timeout=LIVE_REQUEST_TIMEOUT_SEC,
             )
         except asyncio.TimeoutError:
-            logger.warning("Live fetch timeout %.0fs for %s %s, using fallback", LIVE_REQUEST_TIMEOUT_SEC, asset, timeframe)
+            logger.warning(
+                "Live fetch timeout %.0fs for %s %s, using fallback",
+                LIVE_REQUEST_TIMEOUT_SEC,
+                asset,
+                timeframe,
+            )
             result = None
 
         if result:
@@ -417,7 +436,7 @@ async def get_signal(
             if ENABLE_FIRESTORE:
                 save_latest_signal(asset, timeframe, result, source="live", is_demo=IS_DEMO)
                 _maybe_append_history(asset, timeframe, result)
-            _log_source(asset, timeframe, "live")
+            logger.info("Live success: %s %s", asset, timeframe)
             return result
 
         # Step 4: Live failed - prefer memory cache stale (instant)

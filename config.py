@@ -11,11 +11,14 @@ PO_SSID = os.environ.get("PO_SSID", "")
 # Demo mode: 1 = demo, 0 = live
 IS_DEMO = os.environ.get("PO_IS_DEMO", "1").strip().lower() in ("1", "true", "yes")
 
-# Cache: TTL in seconds (5-10 for instant responses)
-CACHE_TTL_SEC = int(os.environ.get("SIGNAL_CACHE_TTL_SEC", "5"))
+# Cache: TTL in seconds (10-20 to keep successful results longer)
+CACHE_TTL_SEC = int(os.environ.get("SIGNAL_CACHE_TTL_SEC", "15"))
 
-# Background refresh: interval in seconds (3-5 for professional bot feel)
-REFRESH_INTERVAL_SEC = int(os.environ.get("SIGNAL_REFRESH_INTERVAL_SEC", "3"))
+# Background refresh: interval in seconds
+REFRESH_INTERVAL_SEC = int(os.environ.get("SIGNAL_REFRESH_INTERVAL_SEC", "5"))
+
+# Delay between background fetches (avoid hammering PocketOption)
+BACKGROUND_FETCH_DELAY_SEC = float(os.environ.get("SIGNAL_BACKGROUND_FETCH_DELAY_SEC", "1.5"))
 
 # Default number of candles to fetch for signal calculation
 DEFAULT_CANDLE_COUNT = int(os.environ.get("SIGNAL_DEFAULT_CANDLE_COUNT", "150"))
@@ -26,28 +29,27 @@ MIN_CANDLES_FOR_SIGNAL = int(os.environ.get("SIGNAL_MIN_CANDLES", "26"))
 # Signal quality: minimum score (90 = strict 4/4 indicators, 75 = 3/4)
 SIGNAL_MIN_SCORE = int(os.environ.get("SIGNAL_MIN_SCORE", "90"))
 
-# Tracked assets: comma-separated list, or default (focused set for fast cycles)
+# Tracked assets: start minimal (EURUSD_otc) to avoid timeouts
 _TRACKED_STR = os.environ.get("SIGNAL_TRACKED_ASSETS", "").strip()
 if _TRACKED_STR:
     TRACKED_ASSETS: List[str] = [a.strip() for a in _TRACKED_STR.split(",") if a.strip()]
 else:
-    TRACKED_ASSETS = [
-        "EURUSD_otc",
-        "USDJPY_otc",
-        "GBPUSD_otc",
+    TRACKED_ASSETS = ["EURUSD_otc"]
+
+# Tracked timeframes: start with 1m only
+_TRACKED_TF_STR = os.environ.get("SIGNAL_TRACKED_TIMEFRAMES", "").strip()
+if _TRACKED_TF_STR:
+    TRACKED_TIMEFRAMES: List[str] = [
+        tf.strip() for tf in _TRACKED_TF_STR.split(",") if tf.strip()
     ]
+else:
+    TRACKED_TIMEFRAMES = ["1m"]
 
-# Tracked timeframes
-_TRACKED_TF_STR = os.environ.get("SIGNAL_TRACKED_TIMEFRAMES", "1m,5m").strip()
-TRACKED_TIMEFRAMES: List[str] = [
-    tf.strip() for tf in _TRACKED_TF_STR.split(",") if tf.strip()
-] or ["1m", "5m"]
+# Candle fetch timeout (seconds) - PocketOption can be slow, especially after cold start
+CANDLE_TIMEOUT_SEC = float(os.environ.get("SIGNAL_CANDLE_TIMEOUT_SEC", "45"))
 
-# Candle request timeout (seconds) - PocketOption candle API can be slow after cold start
-CANDLE_TIMEOUT_SEC = float(os.environ.get("SIGNAL_CANDLE_TIMEOUT_SEC", "30"))
-
-# Live calculation timeout in request path - never block API for long
-LIVE_REQUEST_TIMEOUT_SEC = float(os.environ.get("SIGNAL_LIVE_REQUEST_TIMEOUT_SEC", "3"))
+# Live calculation timeout in /signal request path
+LIVE_REQUEST_TIMEOUT_SEC = float(os.environ.get("SIGNAL_LIVE_REQUEST_TIMEOUT_SEC", "10"))
 
 # Reconnection: max attempts when connection is lost
 RECONNECT_MAX_ATTEMPTS = int(os.environ.get("SIGNAL_RECONNECT_ATTEMPTS", "3"))
