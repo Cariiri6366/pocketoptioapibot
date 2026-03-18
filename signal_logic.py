@@ -1,30 +1,11 @@
 """
-Nuunipay Signals Bot - High-confidence signal generation.
-Returns ONLY strong BUY or SELL signals (90-100% confidence).
-Uses: RSI (<30 buy, >70 sell), EMA trend, MACD, candle momentum.
+Nuunipay Signals Bot - Signal generation. ALWAYS returns buy or sell, never neutral.
+Uses: RSI, EMA, MACD, candle momentum. Fallback rules when data is weak.
 """
 from typing import Literal, Tuple
 
-# Type alias for signal result
-SignalResult = Tuple[Literal["buy", "sell", "neutral"], int, str]
-
-# Minimum score to return a signal (from config, default 90 = strict)
-def _min_score() -> int:
-    try:
-        from config import SIGNAL_MIN_SCORE
-        return SIGNAL_MIN_SCORE
-    except ImportError:
-        return 90
-
-# Output confidence range (always 90-100 when we return BUY/SELL)
-MIN_OUTPUT_CONFIDENCE = 90
-MAX_OUTPUT_CONFIDENCE = 100
-
-# Indicator weights (each contributes up to 25%)
-WEIGHT_RSI = 25
-WEIGHT_EMA = 25
-WEIGHT_MACD = 25
-WEIGHT_MOMENTUM = 25
+# Type alias - direction is always buy or sell
+SignalResult = Tuple[Literal["buy", "sell"], int, str]
 
 
 def _safe_float(val, default: float = 0.0) -> float:
@@ -36,14 +17,14 @@ def _safe_float(val, default: float = 0.0) -> float:
 
 
 def _validate_dataframe(df) -> bool:
-    """Validate that dataframe has required OHLC columns and enough rows."""
+    """Validate dataframe has OHLC columns and at least 1 row."""
     if df is None:
         return False
     try:
         required = ["open", "high", "low", "close"]
         if not all(col in df.columns for col in required):
             return False
-        if len(df) < 26:  # Need enough for MACD (26-period)
+        if len(df) < 1:
             return False
         for col in required:
             if df[col].isna().all() or (df[col] == 0).all():
@@ -53,8 +34,68 @@ def _validate_dataframe(df) -> bool:
         return False
 
 
+def _decide_direction_fallback(df) -> Tuple[Literal["buy", "sell"], int, str]:
+    """
+    Force a direction using fallback rules. NEVER returns neutral.
+    Rules: last 2 candles -> last 5 trend -> EMA -> last candle body.
+    """
+    close = df["close"].astype(float)
+    recent = df.tail(min(50, len(df)))
+
+    # Rule 1: Last 2 completed candles
+    if len(recent) >= 2:
+        c_prev = _safe_float(recent.iloc[-2]["close"])
+        c_last = _safe_float(recent.iloc[-1]["close"])
+        if c_last > c_prev:
+            return "buy", 70, "Fallback bullish direction selected"
+        if c_last < c_prev:
+            return "sell", 70, "Fallback bearish direction selected"
+
+    # Rule 2: Last 5 candles - majority bullish/bearish
+    if len(recent) >= 5:
+        last5 = recent.tail(5)
+        bullish = sum(1 for _, r in last5.iterrows() if _safe_float(r["close"]) > _safe_float(r["open"]))
+        bearish = sum(1 for _, r in last5.iterrows() if _safe_float(r["close"]) < _safe_float(r["open"]))
+        if bullish > bearish:
+            return "buy", 68, "Fallback bullish direction selected"
+        if bearish > bullish:
+            return "sell", 68, "Fallback bearish direction selected"
+
+    # Rule 3: EMA direction
+    if len(close) >= 21:
+        ema_fast = close.ewm(span=9, adjust=False).mean()
+        ema_slow = close.ewm(span=21, adjust=False).mean()
+        if ema_fast.iloc[-1] > ema_slow.iloc[-1]:
+            return "buy", 65, "Fallback bullish direction selected"
+        if ema_fast.iloc[-1] < ema_slow.iloc[-1]:
+            return "sell", 65, "Fallback bearish direction selected"
+
+    # Rule 4: Latest candle body
+    if len(recent) >= 1:
+        r = recent.iloc[-1]
+        o = _safe_float(r["open"])
+        c = _safe_float(r["close"])
+        if c > o:
+            return "buy", 62, "Fallback bullish direction selected"
+        if c < o:
+            return "sell", 62, "Fallback bearish direction selected"
+
+    # Rule 5: Absolute last resort - use close vs first
+    if len(close) >= 1:
+        if close.iloc[-1] >= close.iloc[0]:
+            return "buy", 60, "Fallback bullish direction selected"
+        return "sell", 60, "Fallback bearish direction selected"
+
+    return "buy", 60, "Fallback bullish direction selected"
+
+
+def _ema(series, period: int):
+    """Exponential moving average."""
+    return series.ewm(span=period, adjust=False).mean()
+
+
 def _rsi(close_series, period: int = 14) -> float | None:
-    """Compute RSI. Returns None if insufficient data."""
+    """Compute RSI."""
     if len(close_series) < period + 1:
         return None
     delta = close_series.diff()
@@ -67,17 +108,8 @@ def _rsi(close_series, period: int = 14) -> float | None:
     return float(rsi.iloc[-1]) if not rsi.empty and not rsi.isna().iloc[-1] else None
 
 
-def _ema(series, period: int):
-    """Exponential moving average."""
-    return series.ewm(span=period, adjust=False).mean()
-
-
 def _macd_signal(close_series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[bool | None, bool | None]:
-    """
-    MACD: (fast_ema - slow_ema), signal line.
-    Returns (is_bullish, is_bearish). None if insufficient data.
-    Bullish: MACD line > signal line.
-    """
+    """MACD: bullish if MACD > signal line."""
     if len(close_series) < slow + signal:
         return None, None
     ema_fast = _ema(close_series, fast)
@@ -92,59 +124,46 @@ def _macd_signal(close_series, fast: int = 12, slow: int = 26, signal: int = 9) 
 
 
 def _candle_momentum_bullish(recent_df) -> bool | None:
-    """Last 3 candles: bullish if majority close higher than open."""
+    """Last 3 candles: bullish if majority close > open."""
     if len(recent_df) < 3:
         return None
     last3 = recent_df.tail(3)
-    bullish_count = sum(1 for _, r in last3.iterrows() if _safe_float(r["close"]) > _safe_float(r["open"]))
-    bearish_count = sum(1 for _, r in last3.iterrows() if _safe_float(r["close"]) < _safe_float(r["open"]))
-    if bullish_count > bearish_count:
+    bullish = sum(1 for _, r in last3.iterrows() if _safe_float(r["close"]) > _safe_float(r["open"]))
+    bearish = sum(1 for _, r in last3.iterrows() if _safe_float(r["close"]) < _safe_float(r["open"]))
+    if bullish > bearish:
         return True
-    if bearish_count > bullish_count:
+    if bearish > bullish:
         return False
-    return None  # Tie
+    return None
 
 
-def _ignore_small_movement(close_series, threshold_pct: float = 0.05) -> bool:
-    """True if recent price movement is significant (not noise)."""
-    if len(close_series) < 5:
-        return False
-    recent = close_series.tail(5)
-    low = recent.min()
-    high = recent.max()
-    if low <= 0:
-        return False
-    range_pct = (high - low) / low * 100
-    return range_pct >= threshold_pct
-
-
-def compute_signal(df, min_candles: int = 26) -> SignalResult:
+def compute_signal(df, min_candles: int = 10) -> SignalResult:
     """
-    Compute high-confidence trading signal.
-    Only returns BUY/SELL when score >= 90.
-    Uses: RSI (<30 buy, >70 sell), EMA trend, MACD, candle momentum.
+    Compute trading signal. ALWAYS returns buy or sell, never neutral.
+    Strong confirmation: 90-100. Medium: 75-89. Weak fallback: 60-74.
     """
     if not _validate_dataframe(df):
-        return "neutral", 0, "Not enough data"
+        if df is not None and len(df) >= 1:
+            try:
+                return _decide_direction_fallback(df)
+            except Exception:
+                pass
+        return "buy", 60, "Fallback bullish direction selected"
 
     n = len(df)
-    if n < min_candles:
-        return "neutral", 0, "Not enough data"
+    if n < 2:
+        return "buy", 60, "Fallback bullish direction selected"
 
     try:
         close = df["close"].astype(float)
         recent = df.tail(min(50, n))
 
-        # Ignore small movements (noise)
-        if not _ignore_small_movement(close):
-            return "neutral", 0, "No strong signal"
-
-        # 1. RSI (25%)
+        # RSI
         rsi_val = _rsi(close, 14)
         rsi_buy = rsi_val is not None and rsi_val < 30
         rsi_sell = rsi_val is not None and rsi_val > 70
 
-        # 2. EMA trend (25%): fast 9, slow 21
+        # EMA
         ema_fast = _ema(close, 9)
         ema_slow = _ema(close, 21)
         ema_fast_val = ema_fast.iloc[-1] if len(ema_fast) > 0 else None
@@ -152,70 +171,52 @@ def compute_signal(df, min_candles: int = 26) -> SignalResult:
         ema_bullish = ema_fast_val is not None and ema_slow_val is not None and ema_fast_val > ema_slow_val
         ema_bearish = ema_fast_val is not None and ema_slow_val is not None and ema_fast_val < ema_slow_val
 
-        # 3. MACD (25%)
+        # MACD
         macd_bullish, macd_bearish = _macd_signal(close, 12, 26, 9)
 
-        # 4. Candle momentum - last 3 candles (25%)
+        # Candle momentum
         momentum_bullish = _candle_momentum_bullish(recent)
         momentum_bearish = momentum_bullish is False
         momentum_bullish = momentum_bullish is True
 
-        # Score BUY and SELL separately
+        # Score
         buy_score = 0
         sell_score = 0
-
         if rsi_buy:
-            buy_score += WEIGHT_RSI
+            buy_score += 25
         elif rsi_sell:
-            sell_score += WEIGHT_RSI
-
+            sell_score += 25
         if ema_bullish:
-            buy_score += WEIGHT_EMA
+            buy_score += 25
         elif ema_bearish:
-            sell_score += WEIGHT_EMA
-
+            sell_score += 25
         if macd_bullish:
-            buy_score += WEIGHT_MACD
+            buy_score += 25
         elif macd_bearish:
-            sell_score += WEIGHT_MACD
-
+            sell_score += 25
         if momentum_bullish:
-            buy_score += WEIGHT_MOMENTUM
+            buy_score += 25
         elif momentum_bearish:
-            sell_score += WEIGHT_MOMENTUM
+            sell_score += 25
 
-        min_score = _min_score()
-        # Only return signal if score >= min_score
-        # Scale output confidence to 90-100
-        if buy_score >= min_score and buy_score > sell_score:
-            # 75->90, 100->100
-            denom = max(1, 100 - min_score)
-            conf = int(MIN_OUTPUT_CONFIDENCE + (buy_score - min_score) / denom * (MAX_OUTPUT_CONFIDENCE - MIN_OUTPUT_CONFIDENCE))
-            conf = min(MAX_OUTPUT_CONFIDENCE, max(MIN_OUTPUT_CONFIDENCE, conf))
-            msg = "Strong bullish trend confirmed"
-            if rsi_buy:
-                msg += " (RSI oversold)"
-            if ema_bullish:
-                msg += " (EMA aligned)"
-            if macd_bullish:
-                msg += " (MACD bullish)"
-            return "buy", conf, msg
+        # Strong: 90-100 (4/4 or 3/4 indicators)
+        if buy_score >= 75 and buy_score > sell_score:
+            conf = min(100, 90 + (buy_score - 75) // 5)
+            return "buy", conf, "Bullish momentum detected"
+        if sell_score >= 75 and sell_score > buy_score:
+            conf = min(100, 90 + (sell_score - 75) // 5)
+            return "sell", conf, "Bearish trend confirmed"
 
-        if sell_score >= min_score and sell_score > buy_score:
-            denom = max(1, 100 - min_score)
-            conf = int(MIN_OUTPUT_CONFIDENCE + (sell_score - min_score) / denom * (MAX_OUTPUT_CONFIDENCE - MIN_OUTPUT_CONFIDENCE))
-            conf = min(MAX_OUTPUT_CONFIDENCE, max(MIN_OUTPUT_CONFIDENCE, conf))
-            msg = "Strong bearish trend confirmed"
-            if rsi_sell:
-                msg += " (RSI overbought)"
-            if ema_bearish:
-                msg += " (EMA aligned)"
-            if macd_bearish:
-                msg += " (MACD bearish)"
-            return "sell", conf, msg
+        # Medium: 75-89 (2/4 indicators)
+        if buy_score >= 50 and buy_score > sell_score:
+            conf = min(89, 75 + (buy_score - 50) // 2)
+            return "buy", conf, "Bullish momentum detected"
+        if sell_score >= 50 and sell_score > buy_score:
+            conf = min(89, 75 + (sell_score - 50) // 2)
+            return "sell", conf, "Bearish trend confirmed"
 
-        # No strong signal
-        return "neutral", 0, "No strong signal"
+        # Weak: use fallback rules (60-74)
+        return _decide_direction_fallback(df)
 
     except Exception:
-        return "neutral", 0, "Not enough data"
+        return _decide_direction_fallback(df) if df is not None and len(df) >= 2 else ("buy", 60, "Fallback bullish direction selected")
