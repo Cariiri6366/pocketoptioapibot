@@ -11,11 +11,11 @@ PO_SSID = os.environ.get("PO_SSID", "")
 # Demo mode: 1 = demo, 0 = live
 IS_DEMO = os.environ.get("PO_IS_DEMO", "1").strip().lower() in ("1", "true", "yes")
 
-# Cache: TTL in seconds (how long a cached signal is considered fresh)
-CACHE_TTL_SEC = int(os.environ.get("SIGNAL_CACHE_TTL_SEC", "10"))
+# Cache: TTL in seconds (5-10 for instant responses)
+CACHE_TTL_SEC = int(os.environ.get("SIGNAL_CACHE_TTL_SEC", "5"))
 
-# Background refresh: interval in seconds between precomputing signals
-REFRESH_INTERVAL_SEC = int(os.environ.get("SIGNAL_REFRESH_INTERVAL_SEC", "5"))
+# Background refresh: interval in seconds (3-5 for professional bot feel)
+REFRESH_INTERVAL_SEC = int(os.environ.get("SIGNAL_REFRESH_INTERVAL_SEC", "3"))
 
 # Default number of candles to fetch for signal calculation
 DEFAULT_CANDLE_COUNT = int(os.environ.get("SIGNAL_DEFAULT_CANDLE_COUNT", "150"))
@@ -23,21 +23,15 @@ DEFAULT_CANDLE_COUNT = int(os.environ.get("SIGNAL_DEFAULT_CANDLE_COUNT", "150"))
 # Minimum candles required to produce a signal
 MIN_CANDLES_FOR_SIGNAL = 10
 
-# Tracked assets: comma-separated list, or default set
+# Tracked assets: comma-separated list, or default (focused set for fast cycles)
 _TRACKED_STR = os.environ.get("SIGNAL_TRACKED_ASSETS", "").strip()
 if _TRACKED_STR:
     TRACKED_ASSETS: List[str] = [a.strip() for a in _TRACKED_STR.split(",") if a.strip()]
 else:
     TRACKED_ASSETS = [
         "EURUSD_otc",
-        "USDCHF_otc",
-        "AUDUSD_otc",
-        "GBPUSD_otc",
         "USDJPY_otc",
-        "USDCAD_otc",
-        "AUDCAD_otc",
-        "XAUUSD_otc",
-        "XAGUSD_otc",
+        "GBPUSD_otc",
     ]
 
 # Tracked timeframes
@@ -48,6 +42,9 @@ TRACKED_TIMEFRAMES: List[str] = [
 
 # Candle request timeout (seconds) - PocketOption candle API can be slow after cold start
 CANDLE_TIMEOUT_SEC = float(os.environ.get("SIGNAL_CANDLE_TIMEOUT_SEC", "30"))
+
+# Live calculation timeout in request path - never block API for long
+LIVE_REQUEST_TIMEOUT_SEC = float(os.environ.get("SIGNAL_LIVE_REQUEST_TIMEOUT_SEC", "3"))
 
 # Reconnection: max attempts when connection is lost
 RECONNECT_MAX_ATTEMPTS = int(os.environ.get("SIGNAL_RECONNECT_ATTEMPTS", "3"))

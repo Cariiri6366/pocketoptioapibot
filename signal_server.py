@@ -1,10 +1,10 @@
 """
-Nuunipay Signals Bot - Production-ready FastAPI backend for Render.
+Nuunipay Signals Bot - Ultra-fast FastAPI backend for Render.
+- Background engine: precomputes signals every 3s (EURUSD, USDJPY, GBPUSD × 1m, 5m)
+- Memory cache: 5s TTL, instant response (<50ms) on cache hit
 - Single global PocketOption client (no reconnect per request)
-- In-memory cache by asset:timeframe with configurable TTL
-- Background task precomputes signals for tracked assets
-- Fallback to stale cache when live fetch fails
-- Consistent JSON responses, structured error handling
+- Live requests: 3s timeout max - never block API
+- Fallback: cache → Firestore → live → stale cache → fallback_safe
 """
 import asyncio
 import logging
@@ -37,6 +37,7 @@ from config import (
     FIREBASE_SERVICE_ACCOUNT_JSON,
     HISTORY_WRITE_INTERVAL_SEC,
     IS_DEMO,
+    LIVE_REQUEST_TIMEOUT_SEC,
     MIN_CANDLES_FOR_SIGNAL,
     PO_SSID,
     REFRESH_INTERVAL_SEC,
@@ -168,13 +169,26 @@ def _priority_pairs() -> list[tuple[str, str]]:
     return pairs
 
 
+async def _refresh_one_pair(asset: str, tf: str) -> None:
+    """Refresh one asset/timeframe pair. Used by parallel background loop."""
+    try:
+        result = await _compute_signal(asset, tf)
+        if result:
+            await signal_cache.set(asset, tf, result)
+            save_latest_signal(asset, tf, result, source="live", is_demo=IS_DEMO)
+            _maybe_append_history(asset, tf, result)
+    except InvalidParameterError:
+        pass
+    except Exception as e:
+        logger.debug("Background refresh %s %s: %s", asset, tf, e)
+
+
 async def _background_refresh_loop():
-    """Periodically refresh signals for tracked asset/timeframe pairs. Pre-fills cache before requests."""
+    """Background engine: refresh all pairs in parallel every 3-5s. Pre-fills cache for instant API."""
     pairs = _priority_pairs()
     logger.info(
-        "Background refresh started: %d pairs (priority: %s 1m/5m), interval=%ds",
+        "Background signal engine: %d pairs, interval=%ds (instant cache-first API)",
         len(pairs),
-        pairs[0][0] if pairs else "?",
         REFRESH_INTERVAL_SEC,
     )
     while True:
@@ -184,17 +198,8 @@ async def _background_refresh_loop():
                 await asyncio.sleep(REFRESH_INTERVAL_SEC)
                 continue
 
-            for asset, tf in pairs:
-                try:
-                    result = await _compute_signal(asset, tf)
-                    if result:
-                        await signal_cache.set(asset, tf, result)
-                        save_latest_signal(asset, tf, result, source="live", is_demo=IS_DEMO)
-                        _maybe_append_history(asset, tf, result)
-                except InvalidParameterError:
-                    pass  # Skip invalid asset/tf
-                except Exception as e:
-                    logger.debug("Background refresh %s %s: %s", asset, tf, e)
+            # Run all pairs in parallel for fast cache fill
+            await asyncio.gather(*[_refresh_one_pair(a, t) for a, t in pairs])
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -353,9 +358,12 @@ def _enrich(data: dict, source: str, cached: bool, fallback: bool) -> dict:
     return out
 
 
-def _log_source(asset: str, timeframe: str, source: str) -> None:
-    """Log which source was used (diagnostics)."""
-    logger.debug("Signal %s %s: source=%s", asset, timeframe, source)
+def _log_source(asset: str, timeframe: str, source: str, cache_hit: bool = False) -> None:
+    """Log which source was used. Cache hits at INFO for performance visibility."""
+    if cache_hit or source in ("memory_cache", "memory_cache_stale"):
+        logger.info("Cache hit: %s %s source=%s", asset, timeframe, source)
+    else:
+        logger.debug("Signal %s %s: source=%s", asset, timeframe, source)
 
 
 @app.get("/signal")
@@ -375,14 +383,14 @@ async def get_signal(
         timeframe = "1m"
 
     try:
-        # Step 1: Memory cache (fresh, within TTL)
+        # Step 1: Memory cache (instant - <50ms)
         cached = await signal_cache.get(asset, timeframe)
         if cached:
             resp = _enrich(cached, "memory_cache", cached=True, fallback=False)
-            _log_source(asset, timeframe, "memory_cache")
+            _log_source(asset, timeframe, "memory_cache", cache_hit=True)
             return resp
 
-        # Step 2: Firestore (if enabled, recent data)
+        # Step 2: Firestore (if enabled, fast fallback)
         if ENABLE_FIRESTORE:
             fs_signal = get_latest_signal(asset, timeframe, max_age_sec=FIRESTORE_LATEST_TTL_SEC)
             if fs_signal:
@@ -390,8 +398,16 @@ async def get_signal(
                 _log_source(asset, timeframe, "firestore_fallback")
                 return resp
 
-        # Step 3: Live calculation (retry once inside _compute_signal)
-        result = await _compute_signal(asset, timeframe, count)
+        # Step 3: Live calculation - NEVER block long (timeout 3s)
+        try:
+            result = await asyncio.wait_for(
+                _compute_signal(asset, timeframe, count),
+                timeout=LIVE_REQUEST_TIMEOUT_SEC,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Live fetch timeout %.0fs for %s %s, using fallback", LIVE_REQUEST_TIMEOUT_SEC, asset, timeframe)
+            result = None
+
         if result:
             result["cached"] = False
             result["firestore_fallback"] = False
@@ -404,11 +420,11 @@ async def get_signal(
             _log_source(asset, timeframe, "live")
             return result
 
-        # Step 4: Live failed - prefer memory cache stale (most recent we have)
+        # Step 4: Live failed - prefer memory cache stale (instant)
         stale_cache = await signal_cache.get_stale(asset, timeframe)
         if stale_cache:
             resp = _enrich(stale_cache, "memory_cache", cached=True, fallback=False)
-            _log_source(asset, timeframe, "memory_cache_stale")
+            _log_source(asset, timeframe, "memory_cache_stale", cache_hit=True)
             return resp
 
         # Step 5: Firestore stale (any age - real data from history)
